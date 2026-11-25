@@ -22,6 +22,9 @@ jobs:
       # Set it under Settings → Secrets and variables → Actions → Variables. Until then, "none" builds a
       # static site whose reminders work while the app is open.
       VITE_API_BASE: ${{ vars.VITE_API_BASE || 'none' }}
+      # Use the sign-in helpers in public/__/auth so Google sign-in stays on this origin
+      # (needed for iPhone/iPad Home Screen apps). See src/lib/auth.ts.
+      VITE_FIREBASE_SELF_HOSTED_AUTH: 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

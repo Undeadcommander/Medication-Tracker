@@ -518,6 +518,8 @@ if (fs.existsSync(path.join(DIST_DIR, 'index.html'))) {
   app.use(
     express.static(DIST_DIR, {
       index: false,
+      // Serve /__/auth/handler and /__/auth/iframe (self-hosted Firebase sign-in helpers) from *.html.
+      extensions: ['html'],
       setHeaders(res, filePath) {
         const base = path.basename(filePath);
         if (base === 'sw.js' || base === 'manifest.webmanifest') res.setHeader('Cache-Control', 'no-cache');

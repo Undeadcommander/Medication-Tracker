@@ -15,9 +15,21 @@ export interface User {
 // VITE_FIREBASE_* environment variables override the committed file (e.g. a test project).
 const env = import.meta.env;
 const pick = (fromEnv: string | undefined, fromFile: string) => (fromEnv ?? '').trim() || fromFile.trim();
+/**
+ * Self-hosted sign-in helpers (public/__/auth/*, copied from <project>.firebaseapp.com/__/auth/).
+ * When enabled, authDomain points at this site, e.g. "undeadcommander.github.io/Medication-Tracker",
+ * and the SDK then uses https://<that>/__/auth/handler. Sign-in stays on the app's own origin, which
+ * Safari requires for redirect sign-in in iPhone/iPad Home Screen apps (no third-party storage there).
+ * The Google OAuth client must list https://<that>/__/auth/handler as an authorized redirect URI.
+ */
+const SELF_HOSTED_AUTH = env.VITE_FIREBASE_SELF_HOSTED_AUTH === 'true' && location.protocol === 'https:';
+const selfHostedAuthDomain = `${location.host}${env.BASE_URL.replace(/\/+$/, '')}`;
+
 const firebaseConfig = {
   apiKey: pick(env.VITE_FIREBASE_API_KEY, committedConfig.apiKey),
-  authDomain: pick(env.VITE_FIREBASE_AUTH_DOMAIN, committedConfig.authDomain),
+  authDomain: SELF_HOSTED_AUTH
+    ? selfHostedAuthDomain
+    : pick(env.VITE_FIREBASE_AUTH_DOMAIN, committedConfig.authDomain),
   projectId: pick(env.VITE_FIREBASE_PROJECT_ID, committedConfig.projectId),
   appId: pick(env.VITE_FIREBASE_APP_ID, committedConfig.appId),
 };
