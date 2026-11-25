@@ -1,13 +1,22 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   BUILD_ID,
+  currentGoogleUser,
   FIREBASE_CONFIGURED,
   GUEST_USER,
+  isStandaloneIOS,
   lastSignInAttempt,
+  noteSignInStalled,
   preloadFirebaseAuth,
   signInWithGoogle,
   type User,
 } from '../lib/auth';
+import { preloadSync } from '../lib/sync';
+
+/** Back in the app with no result after this long: the result probably isn't coming. */
+const STALL_AFTER_RETURN_MS = 8_000;
+/** Or this long after the tap, whatever the app was told (time to type a password, 2FA, …). */
+const STALL_AFTER_START_MS = 60_000;
 
 function describeAttempt(): string | null {
   const a = lastSignInAttempt();
@@ -39,7 +48,12 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
   const [error, setError] = useState<string | null>(initialError);
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
+  const [stalled, setStalled] = useState(false);
   const [attempt, setAttempt] = useState(describeAttempt);
+  /** Only the latest tap's sign-in may change the screen (an abandoned one can settle late). */
+  const attemptSeq = useRef(0);
+  const onSignInRef = useRef(onSignIn);
+  onSignInRef.current = onSignIn;
 
   // A redirect sign-in's error arrives after this screen has mounted.
   useEffect(() => {
@@ -59,18 +73,71 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
     };
   }, []);
 
+  // While Google's page is open in an iPhone/iPad Home Screen app: when the user comes back to the
+  // app, a finished sign-in should follow within a second or two. Sometimes it never does (and
+  // Firebase can't tell the page was closed), which used to leave "Signing in…" up forever.
+  // Elsewhere Firebase sees the popup close by itself, and the app window can regain focus while
+  // the popup is still open, so only the long timeout applies.
+  useEffect(() => {
+    if (!busy) return setStalled(false);
+    const seq = attemptSeq.current;
+    const watchReturns = isStandaloneIOS();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stallIn = (ms: number) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        setStalled(true);
+        noteSignInStalled();
+        setAttempt(describeAttempt());
+      }, ms);
+    };
+    const onReturn = () => {
+      if (document.visibilityState !== 'visible') return;
+      // Firebase may have the account already even though the popup call hasn't heard.
+      void currentGoogleUser()
+        .then((u) => u && seq === attemptSeq.current && onSignInRef.current(u))
+        .catch(() => {});
+      stallIn(STALL_AFTER_RETURN_MS);
+    };
+    stallIn(STALL_AFTER_START_MS);
+    if (!watchReturns) return () => clearTimeout(timer);
+    document.addEventListener('visibilitychange', onReturn);
+    window.addEventListener('focus', onReturn);
+    window.addEventListener('pageshow', onReturn);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onReturn);
+      window.removeEventListener('focus', onReturn);
+      window.removeEventListener('pageshow', onReturn);
+    };
+  }, [busy]);
+
   const signIn = async () => {
+    const seq = ++attemptSeq.current;
     setBusy(true);
+    setStalled(false);
     setError(null);
+    // Opens the popup before anything else is awaited (Safari needs it inside the tap).
+    const pending = signInWithGoogle();
+    preloadSync(); // fetch the sync code while the user is on Google's page
     try {
-      const user = await signInWithGoogle();
-      if (user) onSignIn(user);
+      const user = await pending;
+      if (user && seq === attemptSeq.current) onSignIn(user);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Sign-in failed');
+      if (seq === attemptSeq.current) setError(e instanceof Error ? e.message : 'Sign-in failed');
     } finally {
-      setBusy(false);
-      setAttempt(describeAttempt());
+      if (seq === attemptSeq.current) {
+        setBusy(false);
+        setAttempt(describeAttempt());
+      }
     }
+  };
+
+  /** Give up on the pending sign-in (it can't be cancelled, but its result is ignored). */
+  const cancelSignIn = () => {
+    attemptSeq.current++;
+    setBusy(false);
+    setAttempt(describeAttempt());
   };
 
   return (
@@ -88,12 +155,29 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
 
         {FIREBASE_CONFIGURED ? (
           <button type="button" className="btn google-btn" onClick={signIn} disabled={busy || !ready} aria-busy={busy || !ready}>
-            <GoogleLogo />
-            {busy ? 'Signing in…' : ready ? 'Sign in with Google' : 'Loading…'}
+            {busy || !ready ? <span className="spinner" aria-hidden /> : <GoogleLogo />}
+            {busy ? (stalled ? 'Still signing in…' : 'Signing in…') : ready ? 'Sign in with Google' : 'Loading…'}
           </button>
         ) : (
           <div className="alert alert-warning" role="note">
             Google sign-in isn't configured yet. Add your Firebase settings to <code>.env</code> (see README).
+          </div>
+        )}
+
+        {busy && stalled && (
+          <div className="alert alert-warning signin-stalled" role="status">
+            <p>
+              This is taking longer than it should. If you've finished signing in with Google, reload Amendra to pick up
+              your account.
+            </p>
+            <div className="signin-stalled-actions">
+              <button type="button" className="btn btn-sm btn-primary" onClick={() => location.reload()}>
+                Reload
+              </button>
+              <button type="button" className="btn btn-sm btn-ghost" onClick={cancelSignIn}>
+                Cancel
+              </button>
+            </div>
           </div>
         )}
 
@@ -106,7 +190,10 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
         <div className="signin-divider">
           <span>or</span>
         </div>
-        <button type="button" className="btn btn-ghost" onClick={() => onSignIn(GUEST_USER)}>
+        <button type="button" className="btn btn-ghost" onClick={() => {
+            attemptSeq.current++; // a Google sign-in still pending mustn't replace this choice
+            onSignIn(GUEST_USER);
+          }}>
           Continue without an account
         </button>
         <p className="signin-privacy muted">

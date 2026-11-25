@@ -64,6 +64,11 @@ export interface SyncStatus {
   message?: string;
   /** Non-fatal problem worth showing (e.g. items that couldn't be decrypted). */
   warning?: string;
+  /**
+   * The cloud copy has been read and shown on this device since sync started. Until then, a new
+   * device may be missing medications that are on the user's other devices.
+   */
+  cloudLoaded: boolean;
 }
 
 /** A new key or recovery key that's been created but not saved yet (show it to the user first). */
@@ -112,6 +117,13 @@ const STALL_MS = 15 * 60_000;
 
 type FS = typeof import('firebase/firestore');
 let dbPromise: Promise<{ db: Firestore; fs: FS }> | null = null;
+
+/** Start loading Firestore ahead of sync (e.g. while this device's own copy is still loading). */
+export function preloadSync(): void {
+  getDb().catch(() => {
+    /* startSync retries and reports it */
+  });
+}
 
 function getDb(): Promise<{ db: Firestore; fs: FS }> {
   dbPromise ??= (async () => {
@@ -298,6 +310,8 @@ export function startSync(opts: {
 
   // ---------- status ----------
   let dataState: { state: SyncState; message?: string } = { state: 'connecting' };
+  /** See SyncStatus.cloudLoaded. */
+  let cloudLoaded = false;
   /** Last write the server rejected; shown until a later write succeeds. */
   let writeError: string | undefined;
   let keyWarning: string | undefined;
@@ -307,10 +321,13 @@ export function startSync(opts: {
     if (stopped) return;
     const warning = [keyWarning, dataWarning].filter(Boolean).join(' ') || undefined;
     let s: SyncStatus;
-    if (lock === 'unlocked') s = writeError ? { state: 'error', message: writeError, lock, warning } : { ...dataState, lock, warning };
-    else if (lock === 'needs-setup') s = { state: 'setup', lock, warning };
-    else if (lock === 'locked') s = { state: 'locked', lock, warning };
-    else s = metaError ? { state: 'error', lock, message: metaError, warning } : { state: 'connecting', lock, warning };
+    if (lock === 'unlocked') {
+      // metaError: the key was loaded from this device but the account's settings can't be read.
+      const error = writeError ?? metaError;
+      s = error ? { state: 'error', message: error, lock, warning, cloudLoaded } : { ...dataState, lock, warning, cloudLoaded };
+    } else if (lock === 'needs-setup') s = { state: 'setup', lock, warning, cloudLoaded };
+    else if (lock === 'locked') s = { state: 'locked', lock, warning, cloudLoaded };
+    else s = metaError ? { state: 'error', lock, message: metaError, warning, cloudLoaded } : { state: 'connecting', lock, warning, cloudLoaded };
     const key = JSON.stringify(s);
     if (key !== lastStatus) {
       lastStatus = key;
@@ -763,6 +780,7 @@ export function startSync(opts: {
         };
         const merged = mergeAppData(remoteKept, localKept);
         applyRemote(merged); // first: queued uploads read their contents from the local copy
+        markCloudLoaded();
         const refs = [...migrationRefs(remote, decoded.plaintext), ...toRefs(diffAppData(remote.data, merged))];
         firstSyncEntries = new Set(enqueueRefs(refs));
         markUploaded([]); // nothing to upload: done already
@@ -779,6 +797,7 @@ export function startSync(opts: {
     const { shown, uploads, removals } = reconcile({ remote, local, queued, failed: decoded.failedIds, cutoff });
     if (shown.medications !== local.medications || shown.doseLogs !== local.doseLogs) applyRemote(shown);
     if (!fromServer) return;
+    markCloudLoaded();
 
     // This device's newer versions (merged medications, logs changed here): upload. A version is
     // only uploaded once per session, so two devices can't bounce one back and forth.
@@ -816,6 +835,12 @@ export function startSync(opts: {
     const round = tidy.slice(0, MAX_TIDY_PER_ROUND);
     round.forEach((r) => attempted.add(refKey(r)));
     enqueueRefs(round);
+  }
+
+  function markCloudLoaded() {
+    if (cloudLoaded) return;
+    cloudLoaded = true;
+    emit();
   }
 
   function startData() {

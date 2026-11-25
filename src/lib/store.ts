@@ -14,7 +14,7 @@ import {
   type Changes,
 } from './localDb';
 import { logsByMed, stampEdit, supplyOnHand, unitsPerDose } from './supply';
-import { startSync, type SyncHandle, type SyncStatus } from './sync';
+import { preloadSync, startSync, type SyncHandle, type SyncStatus } from './sync';
 import { LOG_RETENTION_MS } from './syncOps';
 import { mergeAppData } from './vault';
 
@@ -381,6 +381,11 @@ export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: 
       window.removeEventListener('storage', onStorage);
     };
   }, [userId, show]);
+
+  // Fetch the sync code and open Firestore's cache while this device's copy is still loading.
+  useEffect(() => {
+    if (syncUid) preloadSync();
+  }, [syncUid]);
 
   // Cloud sync (once this device's copy is loaded, so the first merge sees it).
   useEffect(() => {

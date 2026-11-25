@@ -88,7 +88,7 @@ export interface SignInAttempt {
   at: string;
   method: 'popup' | 'redirect';
   standalone: boolean;
-  result: 'started' | 'ok' | 'cancelled' | 'error' | 'redirect-returned-empty';
+  result: 'started' | 'ok' | 'cancelled' | 'error' | 'redirect-returned-empty' | 'stalled';
   code?: string;
 }
 
@@ -113,6 +113,22 @@ export function lastSignInAttempt(): SignInAttempt | null {
   }
 }
 
+/** The pending sign-in hasn't come back long after the user returned to the app (for diagnostics). */
+export function noteSignInStalled(): void {
+  if (lastSignInAttempt()?.result === 'started') recordAttempt({ result: 'stalled' });
+}
+
+/**
+ * The account Firebase has signed in, if any. Firebase can finish a sign-in without the pending
+ * popup call hearing about it (e.g. the result reached this app's storage from Google's page).
+ */
+export async function currentGoogleUser(): Promise<User | null> {
+  if (!FIREBASE_CONFIGURED) return null;
+  const { auth } = await loadFirebase();
+  await auth.authStateReady();
+  return auth.currentUser ? toUser(auth.currentUser) : null;
+}
+
 /** Google serves 96px avatars by default; ask for a sharper one. */
 function sharperPhoto(url: string | null): string | undefined {
   if (!url) return undefined;
@@ -130,7 +146,8 @@ function toUser(fb: FirebaseUser): User {
   };
 }
 
-function isStandaloneIOS(): boolean {
+/** Running as an iPhone/iPad Home Screen app. */
+export function isStandaloneIOS(): boolean {
   const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const standalone =
     window.matchMedia('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true;
@@ -153,6 +170,10 @@ function friendlyError(e: unknown): Error {
  * Start Google sign-in with a popup, everywhere (including iPhone/iPad Home Screen apps, where
  * redirect sign-in loses its result). Falls back to a full-page redirect only if the popup is
  * blocked. Resolves null if the user cancelled or a redirect started.
+ *
+ * In iPhone/iPad Home Screen apps Google's page opens in a separate browser layer that Firebase
+ * can't watch, so if its result never arrives this never settles (closing the page isn't seen as
+ * a cancel). The sign-in screen watches for that; see SignInScreen.
  */
 export async function signInWithGoogle(): Promise<User | null> {
   // No await before the popup opens when Firebase is preloaded: keeps Safari's user gesture.

@@ -52,6 +52,32 @@ function useNow(intervalMs = 30_000): Date {
   return now;
 }
 
+/** Whether the browser thinks it's online. */
+function useOnline(): boolean {
+  const [online, setOnline] = useState(() => typeof navigator === 'undefined' || navigator.onLine !== false);
+  useEffect(() => {
+    const update = () => setOnline(navigator.onLine !== false);
+    window.addEventListener('online', update);
+    window.addEventListener('offline', update);
+    return () => {
+      window.removeEventListener('online', update);
+      window.removeEventListener('offline', update);
+    };
+  }, []);
+  return online;
+}
+
+/** `value`, but only once it has stayed true for `ms` (so a quick blip doesn't flash on screen). */
+function useSettled(value: boolean, ms: number): boolean {
+  const [settled, setSettled] = useState(false);
+  useEffect(() => {
+    if (!value) return setSettled(false);
+    const t = setTimeout(() => setSettled(true), ms);
+    return () => clearTimeout(t);
+  }, [value, ms]);
+  return value && settled;
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(() => loadSession());
   const [authError, setAuthError] = useState<string | null>(null);
@@ -147,7 +173,18 @@ function Tracker({
   const [needsNotifSetup, setNeedsNotifSetup] = useState(false);
   const [syncTick, setSyncTick] = useState(0);
   const now = useNow();
+  const online = useOnline();
   const lock = syncStatus?.lock;
+  // The cloud copy hasn't been read yet: medications from the user's other devices may still be on
+  // their way (on a new device, everything is). Not while locked: the unlock prompt covers that.
+  const cloudWaiting =
+    Boolean(syncUid) && loaded && !syncStatus?.cloudLoaded && (!lock || lock === 'checking' || lock === 'unlocked');
+  // Firestore reports its cached copy first, which looks "offline" until the server answers.
+  const cacheOnly = useSettled(cloudWaiting && syncStatus?.state === 'offline', 5000);
+  const cloudOffline = cloudWaiting && (!online || cacheOnly);
+  const cloudError = cloudWaiting && syncStatus?.state === 'error' ? syncStatus.message ?? "Couldn't reach cloud sync." : null;
+  const cloudSyncing = cloudWaiting && !cloudOffline && !cloudError;
+  const showSyncNote = useSettled(cloudSyncing, 400);
   const encryptionPrompted = useRef(false);
   const logDoseRef = useRef(logDose);
   logDoseRef.current = logDose;
@@ -265,6 +302,18 @@ function Tracker({
           <p className="muted">
             {now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}
           </p>
+          {meds.length > 0 && (showSyncNote || cloudOffline) && (
+            <p className="sync-note" role="status">
+              {cloudOffline ? (
+                "Offline: showing what's saved on this device."
+              ) : (
+                <>
+                  <span className="spinner" aria-hidden />
+                  Syncing with your other devices…
+                </>
+              )}
+            </p>
+          )}
         </div>
 
         {saveError && (
@@ -295,10 +344,40 @@ function Tracker({
           </div>
         )}
 
+        {cloudError && (
+          <div className="alert alert-error" role="alert">
+            {cloudError} Your medications from your other devices will appear once sync reconnects.
+          </div>
+        )}
+
         {!loaded ? (
-          <p className="muted" role="status">
+          <p className="sync-note" role="status">
+            <span className="spinner" aria-hidden />
             Loading…
           </p>
+        ) : meds.length === 0 && cloudSyncing ? (
+          <section className="empty card" role="status">
+            <span className="spinner" aria-hidden />
+            <h2>Syncing your medications…</h2>
+            <p className="muted">
+              Getting your medications and dose history from your other devices. This can take a few seconds the first
+              time.
+            </p>
+          </section>
+        ) : meds.length === 0 && cloudOffline ? (
+          <section className="empty card" role="status">
+            <div className="empty-icon" aria-hidden>
+              📡
+            </div>
+            <h2>Waiting for a connection</h2>
+            <p className="muted">
+              Your medications from your other devices will appear here once you're back online. Anything you add now
+              is saved on this device and syncs later.
+            </p>
+            <button type="button" className="btn btn-primary" onClick={() => setDialog({ kind: 'add' })}>
+              Add medication
+            </button>
+          </section>
         ) : meds.length === 0 ? (
           <section className="empty card">
             <div className="empty-icon" aria-hidden>
