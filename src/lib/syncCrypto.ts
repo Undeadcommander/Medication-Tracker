@@ -167,9 +167,13 @@ export async function parseRecoveryKey(input: string): Promise<Bytes> {
   return raw;
 }
 
-/** Quick syntactic check (no checksum) used by the UI to choose which unlock path to try. */
+/**
+ * Quick syntactic check (no checksum) used by the UI to choose which unlock path to try first:
+ * the displayed format (7 dash-separated groups of 4) or the same 28 characters run together.
+ * A passphrase can match too, so callers fall back to trying it as a passphrase.
+ */
 export function looksLikeRecoveryKey(input: string): boolean {
-  return /^[0-9A-Z]{28}$/i.test(input.replace(/[\s-]/g, ''));
+  return /^\s*[0-9a-z]{4}(-[0-9a-z]{4}){6}\s*$/i.test(input) || /^\s*[0-9a-z]{28}\s*$/i.test(input);
 }
 
 // ---------------------------------------------------------------------------------------------

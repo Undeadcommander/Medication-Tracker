@@ -1,6 +1,6 @@
 import { useId, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { describeKeyError, type PreparedKeyChange, type SyncHandle, type SyncStatus } from '../lib/sync';
-import { looksLikeRecoveryKey, MIN_SYNC_PASSPHRASE_LENGTH } from '../lib/syncCrypto';
+import { looksLikeRecoveryKey, MIN_SYNC_PASSPHRASE_LENGTH, SyncCryptoError } from '../lib/syncCrypto';
 import { estimatePassphraseStrength, generatePassphrase } from '../lib/vault';
 import { Modal } from './Modal';
 import './ExportImportDialog.css';
@@ -273,12 +273,24 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
   const onUnlock = async (e: FormEvent) => {
     e.preventDefault();
     if (!secret) return;
-    const kind = useRecovery || looksLikeRecoveryKey(secret) ? 'recovery' : 'passphrase';
-    const ok = await run('Unlocking…', async () => {
-      await controls!.unlock(secret, kind);
-      return true;
+    const kind = await run('Unlocking…', async (): Promise<'recovery' | 'passphrase'> => {
+      if (useRecovery) {
+        await controls!.unlock(secret, 'recovery');
+        return 'recovery';
+      }
+      if (looksLikeRecoveryKey(secret)) {
+        // Pasted a recovery key into the passphrase field? Try that first, then as a passphrase.
+        try {
+          await controls!.unlock(secret, 'recovery');
+          return 'recovery';
+        } catch (err) {
+          if (!(err instanceof SyncCryptoError) || !['invalid-recovery-key', 'wrong-recovery-key'].includes(err.code)) throw err;
+        }
+      }
+      await controls!.unlock(secret, 'passphrase');
+      return 'passphrase';
     });
-    if (ok) {
+    if (kind) {
       setSecret('');
       if (kind === 'recovery') go({ kind: 'recovered' });
       else onClose();

@@ -11,6 +11,7 @@ import {
   encryptLog,
   encryptMed,
   formatRecoveryKey,
+  looksLikeRecoveryKey,
   parseCryptoMeta,
   parseRecoveryKey,
   readRecoveryKey,
@@ -103,6 +104,13 @@ describe('key wrapping', () => {
     expect(await errorCode(unlockWithPassphrase(damaged, UID, PASS))).toBe('corrupt');
     expect(() => parseCryptoMeta({ ...meta, v: 2 })).toThrow(SyncCryptoError);
     expect(() => parseCryptoMeta({ ...meta, pass: { ...meta.pass, iterations: 10 } })).toThrow(SyncCryptoError);
+  });
+
+  it('only the recovery-key format is auto-detected, not a 28-character passphrase with spaces', async () => {
+    const { recoveryKey } = await bundleP;
+    expect(looksLikeRecoveryKey(recoveryKey)).toBe(true);
+    expect(looksLikeRecoveryKey(recoveryKey.replace(/-/g, ''))).toBe(true);
+    expect(looksLikeRecoveryKey('e2e test violet harbor quilt 4821')).toBe(false);
   });
 
   it('recovery key round-trips through formatting with typo-tolerant parsing', async () => {
