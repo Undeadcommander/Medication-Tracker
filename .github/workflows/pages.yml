@@ -25,6 +25,8 @@ jobs:
       # Use the sign-in helpers in public/__/auth so Google sign-in stays on this origin
       # (needed for iPhone/iPad Home Screen apps). See src/lib/auth.ts.
       VITE_FIREBASE_SELF_HOSTED_AUTH: 'true'
+      # Shown on the sign-in screen so a device can confirm it's running the latest deploy.
+      VITE_BUILD_ID: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

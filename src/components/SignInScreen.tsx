@@ -1,5 +1,20 @@
-import { useState } from 'react';
-import { FIREBASE_CONFIGURED, GUEST_USER, signInWithGoogle, type User } from '../lib/auth';
+import { useEffect, useState } from 'react';
+import {
+  BUILD_ID,
+  FIREBASE_CONFIGURED,
+  GUEST_USER,
+  lastSignInAttempt,
+  preloadFirebaseAuth,
+  signInWithGoogle,
+  type User,
+} from '../lib/auth';
+
+function describeAttempt(): string | null {
+  const a = lastSignInAttempt();
+  if (!a) return null;
+  const when = new Date(a.at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return `${a.method}${a.standalone ? ' · home-screen app' : ''} · ${a.result}${a.code ? ` (${a.code})` : ''} · ${when}`;
+}
 
 interface Props {
   onSignIn: (user: User) => void;
@@ -21,6 +36,26 @@ function GoogleLogo() {
 export function SignInScreen({ onSignIn, initialError = null }: Props) {
   const [error, setError] = useState<string | null>(initialError);
   const [busy, setBusy] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [attempt, setAttempt] = useState(describeAttempt);
+
+  // A redirect sign-in's error arrives after this screen has mounted.
+  useEffect(() => {
+    if (initialError) setError(initialError);
+    setAttempt(describeAttempt());
+  }, [initialError]);
+
+  // Load Firebase before the tap so the popup opens straight from it (Safari blocks it otherwise).
+  useEffect(() => {
+    if (!FIREBASE_CONFIGURED) return;
+    let alive = true;
+    preloadFirebaseAuth()
+      .then(() => alive && setReady(true))
+      .catch(() => alive && setReady(true)); // signInWithGoogle retries the load and reports errors
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const signIn = async () => {
     setBusy(true);
@@ -32,6 +67,7 @@ export function SignInScreen({ onSignIn, initialError = null }: Props) {
       setError(e instanceof Error ? e.message : 'Sign-in failed');
     } finally {
       setBusy(false);
+      setAttempt(describeAttempt());
     }
   };
 
@@ -43,9 +79,9 @@ export function SignInScreen({ onSignIn, initialError = null }: Props) {
         <p className="muted">Keep track of your medications, schedules and reminders, all in one place.</p>
 
         {FIREBASE_CONFIGURED ? (
-          <button type="button" className="btn google-btn" onClick={signIn} disabled={busy} aria-busy={busy}>
+          <button type="button" className="btn google-btn" onClick={signIn} disabled={busy || !ready} aria-busy={busy || !ready}>
             <GoogleLogo />
-            {busy ? 'Signing in…' : 'Sign in with Google'}
+            {busy ? 'Signing in…' : ready ? 'Sign in with Google' : 'Loading…'}
           </button>
         ) : (
           <div className="alert alert-warning" role="note">
@@ -68,6 +104,10 @@ export function SignInScreen({ onSignIn, initialError = null }: Props) {
         <p className="signin-privacy muted">
           Your medication data stays on this device. Signing in keeps each account's data separate and shows your
           profile picture. Use encrypted export to move data to another device.
+        </p>
+        <p className="signin-diag muted" aria-label="Diagnostics">
+          Build {BUILD_ID}
+          {attempt && <> · Last sign-in: {attempt}</>}
         </p>
       </div>
     </main>

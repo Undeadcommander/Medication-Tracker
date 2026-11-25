@@ -40,18 +40,68 @@ export const FIREBASE_CONFIGURED = Boolean(
 
 const SESSION_KEY = 'medtracker.session';
 
-// Firebase is loaded lazily so guests and unconfigured builds never download it.
-let authPromise: Promise<Auth> | null = null;
+// Firebase is loaded lazily so guests and unconfigured builds never download it. The sign-in
+// screen preloads it, so a tap can open Google's popup synchronously (Safari blocks popups that
+// open after an await, i.e. outside the tap's user gesture).
+type AuthModule = typeof import('firebase/auth');
+let loaded: { auth: Auth; mod: AuthModule } | null = null;
+let loadPromise: Promise<{ auth: Auth; mod: AuthModule }> | null = null;
+
+function loadFirebase(): Promise<{ auth: Auth; mod: AuthModule }> {
+  if (!FIREBASE_CONFIGURED) return Promise.reject(new Error('Firebase is not configured'));
+  loadPromise ??= (async () => {
+    const [{ initializeApp }, mod] = await Promise.all([import('firebase/app'), import('firebase/auth')]);
+    const auth = mod.getAuth(initializeApp(firebaseConfig));
+    auth.useDeviceLanguage();
+    loaded = { auth, mod };
+    return loaded;
+  })().catch((e) => {
+    loadPromise = null;
+    throw e;
+  });
+  return loadPromise;
+}
 
 function getFirebaseAuth(): Promise<Auth> {
-  if (!FIREBASE_CONFIGURED) return Promise.reject(new Error('Firebase is not configured'));
-  authPromise ??= (async () => {
-    const [{ initializeApp }, { getAuth }] = await Promise.all([import('firebase/app'), import('firebase/auth')]);
-    const auth = getAuth(initializeApp(firebaseConfig));
-    auth.useDeviceLanguage();
-    return auth;
-  })();
-  return authPromise;
+  return loadFirebase().then((x) => x.auth);
+}
+
+/** Start loading Firebase Auth ahead of the sign-in tap. Resolves when it's ready. */
+export function preloadFirebaseAuth(): Promise<void> {
+  return FIREBASE_CONFIGURED ? loadFirebase().then(() => undefined) : Promise.resolve();
+}
+
+// ---------- diagnostics (shown on the sign-in screen to debug device-specific failures) ----------
+
+export const BUILD_ID: string = (import.meta.env.VITE_BUILD_ID ?? '').slice(0, 7) || 'dev';
+
+export interface SignInAttempt {
+  at: string;
+  method: 'popup' | 'redirect';
+  standalone: boolean;
+  result: 'started' | 'ok' | 'cancelled' | 'error' | 'redirect-returned-empty';
+  code?: string;
+}
+
+const ATTEMPT_KEY = 'medtracker.lastSignIn';
+
+function recordAttempt(patch: Partial<SignInAttempt>): void {
+  try {
+    const prev = lastSignInAttempt();
+    const next = { ...(prev ?? {}), ...patch, at: new Date().toISOString() };
+    localStorage.setItem(ATTEMPT_KEY, JSON.stringify(next));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+export function lastSignInAttempt(): SignInAttempt | null {
+  try {
+    const raw = localStorage.getItem(ATTEMPT_KEY);
+    return raw ? (JSON.parse(raw) as SignInAttempt) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Google serves 96px avatars by default; ask for a sharper one. */
@@ -91,40 +141,49 @@ function friendlyError(e: unknown): Error {
 }
 
 /**
- * Start Google sign-in. Uses a popup, or a full-page redirect where popups don't work
- * (iOS Home Screen apps, blocked popups). Resolves null if the user cancelled or a redirect started.
+ * Start Google sign-in with a popup, everywhere (including iPhone/iPad Home Screen apps, where
+ * redirect sign-in loses its result). Falls back to a full-page redirect only if the popup is
+ * blocked. Resolves null if the user cancelled or a redirect started.
  */
 export async function signInWithGoogle(): Promise<User | null> {
-  const auth = await getFirebaseAuth();
-  const { GoogleAuthProvider, signInWithPopup, signInWithRedirect } = await import('firebase/auth');
-  const provider = new GoogleAuthProvider();
+  // No await before the popup opens when Firebase is preloaded: keeps Safari's user gesture.
+  const { auth, mod } = loaded ?? (await loadFirebase());
+  const provider = new mod.GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
-  if (isStandaloneIOS()) {
-    await signInWithRedirect(auth, provider);
-    return null;
-  }
+  const standalone = isStandaloneIOS();
+  recordAttempt({ method: 'popup', standalone, result: 'started', code: undefined });
   try {
-    const cred = await signInWithPopup(auth, provider);
+    const cred = await mod.signInWithPopup(auth, provider);
+    recordAttempt({ result: 'ok' });
     return toUser(cred.user);
   } catch (e) {
     const code = (e as { code?: string })?.code;
-    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return null;
-    if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
-      await signInWithRedirect(auth, provider);
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      recordAttempt({ result: 'cancelled', code });
       return null;
     }
+    if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
+      recordAttempt({ method: 'redirect', result: 'started', code });
+      await mod.signInWithRedirect(auth, provider);
+      return null;
+    }
+    recordAttempt({ result: 'error', code: code ?? (e instanceof Error ? e.message.slice(0, 80) : 'unknown') });
     throw friendlyError(e);
   }
 }
 
-/** Surface errors from a redirect sign-in that just returned to the app. */
+/** Finish a redirect sign-in that just returned to the app, surfacing its errors. */
 export async function completeRedirectSignIn(): Promise<void> {
   if (!FIREBASE_CONFIGURED) return;
-  const auth = await getFirebaseAuth();
-  const { getRedirectResult } = await import('firebase/auth');
+  const { auth, mod } = await loadFirebase();
+  const pending = lastSignInAttempt();
   try {
-    await getRedirectResult(auth);
+    const cred = await mod.getRedirectResult(auth);
+    if (pending?.method === 'redirect' && pending.result === 'started') {
+      recordAttempt({ result: cred || auth.currentUser ? 'ok' : 'redirect-returned-empty' });
+    }
   } catch (e) {
+    recordAttempt({ result: 'error', code: (e as { code?: string })?.code ?? 'unknown' });
     throw friendlyError(e);
   }
 }
