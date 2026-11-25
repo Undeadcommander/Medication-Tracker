@@ -1,0 +1,15 @@
+rules_version = '2';
+
+// MedTracker cloud sync. Each signed-in Google account can read and write only its own data:
+//   users/{uid}/meds/{medId}       one document per medication
+//   users/{uid}/logs/{YYYY-MM}     dose history, one document per month
+// Everything else is denied.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid}/{collection}/{docId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == uid
+        && collection in ['meds', 'logs'];
+    }
+  }
+}

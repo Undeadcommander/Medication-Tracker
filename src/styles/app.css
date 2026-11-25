@@ -891,3 +891,38 @@
   margin: 0;
   font-size: 0.85rem;
 }
+
+/* ---------- Cloud sync status (account menu) ---------- */
+.account-sync {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  max-width: 190px;
+}
+.account-sync-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+.sync-synced .account-sync-dot {
+  background: var(--success);
+}
+.sync-saving .account-sync-dot,
+.sync-connecting .account-sync-dot {
+  background: var(--primary);
+}
+.sync-offline .account-sync-dot {
+  background: var(--warning);
+}
+.sync-error {
+  color: var(--danger);
+}
+.sync-error .account-sync-dot {
+  background: var(--danger);
+}

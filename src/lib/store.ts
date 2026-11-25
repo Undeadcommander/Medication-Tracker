@@ -1,6 +1,7 @@
 // Local, per-account persistence of medications and dose history.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppData, DoseLog, DoseStatus, Medication } from '../../shared/types';
+import { startSync, type SyncHandle, type SyncStatus } from './sync';
 
 const PREFIX = 'medtracker.data.';
 
@@ -108,18 +109,42 @@ export function applyUndoDose(d: AppData, medId: string, scheduledFor: string): 
   };
 }
 
-export function useAppData(userId: string) {
-  const [data, setData] = useState<AppData>(() => readData(userId));
+/**
+ * The signed-in account's data. Edits are saved to this device immediately; when `syncUid` is
+ * given (a Google account), they're also synced to the cloud and edits from other devices arrive.
+ */
+export function useAppData(userId: string, syncUid?: string) {
+  const [data, setDataState] = useState<AppData>(() => readData(userId));
   const [saveError, setSaveError] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const loadedFor = useRef(userId);
+  // The latest state, updated synchronously so each edit is diffed against what preceded it.
+  const dataRef = useRef(data);
+  const syncRef = useRef<SyncHandle | null>(null);
+
+  /** Data that didn't come from a local edit (cloud, another tab, account switch). */
+  const applyExternal = useCallback((next: AppData) => {
+    dataRef.current = next;
+    setDataState(next);
+  }, []);
+
+  /** A local edit: update state and hand the change to cloud sync. */
+  const commit = useCallback((fn: (d: AppData) => AppData) => {
+    const prev = dataRef.current;
+    const next = fn(prev);
+    if (next === prev) return;
+    dataRef.current = next;
+    setDataState(next);
+    syncRef.current?.push(prev, next);
+  }, []);
 
   // Reload when the account changes.
   useEffect(() => {
     if (loadedFor.current !== userId) {
       loadedFor.current = userId;
-      setData(readData(userId));
+      applyExternal(readData(userId));
     }
-  }, [userId]);
+  }, [userId, applyExternal]);
 
   // Persist on change.
   useEffect(() => {
@@ -129,42 +154,69 @@ export function useAppData(userId: string) {
   // Sync across tabs.
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
-      if (e.key === storageKey(userId)) setData(readData(userId));
+      if (e.key === storageKey(userId)) applyExternal(readData(userId));
     };
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);
-  }, [userId]);
+  }, [userId, applyExternal]);
 
-  const saveMedication = useCallback((med: Medication) => {
-    setData((d) => {
-      const exists = d.medications.some((m) => m.id === med.id);
-      const next = { ...med, updatedAt: new Date().toISOString() };
-      return {
-        ...d,
-        medications: exists ? d.medications.map((m) => (m.id === med.id ? next : m)) : [...d.medications, next],
-      };
+  // Cloud sync.
+  useEffect(() => {
+    if (!syncUid) {
+      setSyncStatus(null);
+      return;
+    }
+    const handle = startSync({
+      uid: syncUid,
+      getLocal: () => dataRef.current,
+      applyRemote: applyExternal,
+      onStatus: setSyncStatus,
     });
-  }, []);
+    syncRef.current = handle;
+    return () => {
+      handle.stop();
+      if (syncRef.current === handle) syncRef.current = null;
+    };
+  }, [syncUid, applyExternal]);
 
-  const deleteMedication = useCallback((id: string) => {
-    setData((d) => ({
-      ...d,
-      medications: d.medications.filter((m) => m.id !== id),
-      doseLogs: d.doseLogs.filter((l) => l.medId !== id),
-    }));
-  }, []);
+  const saveMedication = useCallback(
+    (med: Medication) =>
+      commit((d) => {
+        const exists = d.medications.some((m) => m.id === med.id);
+        const next = { ...med, updatedAt: new Date().toISOString() };
+        return {
+          ...d,
+          medications: exists ? d.medications.map((m) => (m.id === med.id ? next : m)) : [...d.medications, next],
+        };
+      }),
+    [commit],
+  );
 
-  const logDose = useCallback((medId: string, scheduledFor: string, status: DoseStatus) => {
-    setData((d) => applyLogDose(d, medId, scheduledFor, status));
-  }, []);
+  const deleteMedication = useCallback(
+    (id: string) =>
+      commit((d) => ({
+        ...d,
+        medications: d.medications.filter((m) => m.id !== id),
+        doseLogs: d.doseLogs.filter((l) => l.medId !== id),
+      })),
+    [commit],
+  );
 
-  const undoDose = useCallback((medId: string, scheduledFor: string) => {
-    setData((d) => applyUndoDose(d, medId, scheduledFor));
-  }, []);
+  const logDose = useCallback(
+    (medId: string, scheduledFor: string, status: DoseStatus) =>
+      commit((d) => applyLogDose(d, medId, scheduledFor, status)),
+    [commit],
+  );
 
-  const replaceData = useCallback((next: AppData) => setData(next), []);
+  const undoDose = useCallback(
+    (medId: string, scheduledFor: string) => commit((d) => applyUndoDose(d, medId, scheduledFor)),
+    [commit],
+  );
 
-  return { data, saveError, saveMedication, deleteMedication, logDose, undoDose, replaceData };
+  /** Imports count as local edits, so they sync too. */
+  const replaceData = useCallback((next: AppData) => commit(() => next), [commit]);
+
+  return { data, saveError, syncStatus, saveMedication, deleteMedication, logDose, undoDose, replaceData };
 }
 
 /** Per-device preferences that aren't part of the exported data. */

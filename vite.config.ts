@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  // Firebase/Firestore is a lazily loaded chunk (~580 kB, signed-in users only).
+  build: { chunkSizeWarningLimit: 700 },
   server: {
     port: 5173,
     proxy: { '/api': 'http://localhost:8787' },

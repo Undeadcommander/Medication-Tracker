@@ -10,7 +10,7 @@ A medication tracker you can install as an app (PWA). Add your medications, set 
 - **Reminders.** Each medication has its own on/off switch for notifications, and reminders follow its schedule. The notification has **Mark as taken** and **Snooze 10 min** buttons. *Discreet mode* leaves the medication name out of notifications and never sends it to the server.
 - **Today panel.** Take, skip or undo each dose. Supply on hand counts down automatically.
 - **Encrypted export/import.** Your data is encrypted on your device into a `.medvault` file (AES-256-GCM, key from your passphrase with PBKDF2-SHA-256 at 600,000 iterations). Import it on another device to merge with or replace that device's data. No server ever sees it.
-- **Google sign-in.** Your Google profile picture becomes your account icon, and each account's data is kept separately on the device. A guest mode works without an account. Guest data moves into your account the first time you sign in.
+- **Google sign-in with cloud sync.** Your Google profile picture becomes your account icon. Medications and dose history sync across every device where you're signed in, and it works offline: edits are saved on the device and upload when you reconnect. The account menu shows the sync status. A guest mode works without an account and keeps everything on the device. Guest data moves into your account the first time you sign in.
 
 ## Running it
 
@@ -59,10 +59,18 @@ How it works: whenever your medications or dose log change, the client works out
 
 ## Privacy
 
-- Your medications and dose history are stored only in this browser's local storage. There is no account database.
+- **Guests:** medications and dose history are stored only in this browser's local storage.
+- **Google accounts:** data is also stored in Cloud Firestore in the `sign-in-for-med` Firebase project, under `users/{uid}/`. The security rules in [`firebase/firestore.rules`](firebase/firestore.rules) let each signed-in account read and write only its own documents. The data is not end-to-end encrypted: like any Firestore data, it's encrypted at rest by Google but readable by the project's owners. Signing out clears Firestore's offline cache from the device.
 - The push server stores only the push subscription and upcoming reminder times and text for each device. With discreet mode on, the text is generic.
 - Name lookups send the text you type to the public NLM (`clinicaltables.nlm.nih.gov`, `rxnav.nlm.nih.gov`) and openFDA (`api.fda.gov`) APIs. These are free, keyless public services. openFDA allows about 1,000 requests a day per IP without a key, and results are cached locally for 30 days.
 - Exports are encrypted end to end. If you lose the passphrase, the file can't be recovered.
+
+### Cloud sync (Firestore)
+
+- **Data layout:** `users/{uid}/meds/{medId}` holds one document per medication (`{ med, updatedAt }`). `users/{uid}/logs/{YYYY-MM}` holds dose history, one document per month (`{ logs: { [logId]: DoseLog } }`), so each new dose record is a small merge write.
+- **How it works:** the device's local copy is what the UI shows. Each edit becomes small operations (`src/lib/syncOps.ts`), which are queued in `localStorage` until the server acknowledges them and written through Firestore's IndexedDB offline cache. Snapshots from the server replace the local copy. The first time an account syncs on a device, local and cloud data are merged. Logs recorded for the same dose on two devices are collapsed, and the newest wins.
+- **Rules:** to change them, edit [`firebase/firestore.rules`](firebase/firestore.rules) and publish it in **Firebase console → Firestore → Rules** (or with `npx firebase-tools deploy --only firestore:rules --project sign-in-for-med`).
+- **Cost:** it stays within the free Spark plan for personal use (50k reads and 20k writes a day).
 
 ## Project layout
 

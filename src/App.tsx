@@ -11,6 +11,7 @@ import { TodayPanel } from './components/TodayPanel';
 import { clearSession, completeRedirectSignIn, loadSession, saveSession, signOut, watchAuth, type User } from './lib/auth';
 import { getPushState, onServiceWorkerMessage, registerServiceWorker, syncReminders } from './lib/push';
 import { adoptGuestData, loadPrefs, savePrefs, useAppData } from './lib/store';
+import { clearSyncCache } from './lib/sync';
 import { mergeAppData } from './lib/vault';
 
 type Dialog =
@@ -75,6 +76,7 @@ export default function App() {
       onSignOut={async () => {
         try {
           await signOut(user);
+          await clearSyncCache();
         } finally {
           setUser(null);
         }
@@ -84,7 +86,12 @@ export default function App() {
 }
 
 function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
-  const { data, saveError, saveMedication, deleteMedication, logDose, undoDose, replaceData } = useAppData(user.id);
+  // Google accounts sync through Firestore; the Firebase uid follows the "firebase:" prefix.
+  const syncUid = user.provider === 'google' && user.id.startsWith('firebase:') ? user.id.slice('firebase:'.length) : undefined;
+  const { data, saveError, syncStatus, saveMedication, deleteMedication, logDose, undoDose, replaceData } = useAppData(
+    user.id,
+    syncUid,
+  );
   const [dialog, setDialog] = useState<Dialog>(null);
   const [prefs, setPrefs] = useState(loadPrefs);
   const [lastSync, setLastSync] = useState<{ count: number; mode: 'push' | 'local' | 'off' } | null>(null);
@@ -167,6 +174,7 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
             </span>
           </button>
           <AccountMenu
+            syncStatus={syncStatus}
             user={user}
             onNotifications={() => setDialog({ kind: 'notifications' })}
             onExportImport={() => setDialog({ kind: 'vault' })}

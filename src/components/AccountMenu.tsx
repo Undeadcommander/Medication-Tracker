@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { initials, type User } from '../lib/auth';
+import type { SyncStatus } from '../lib/sync';
 
 interface Props {
   user: User;
+  syncStatus?: SyncStatus | null;
   onNotifications: () => void;
   onExportImport: () => void;
   onSignOut: () => void;
@@ -31,7 +33,15 @@ export function Avatar({ user, size = 36 }: { user: User; size?: number }) {
   );
 }
 
-export function AccountMenu({ user, onNotifications, onExportImport, onSignOut }: Props) {
+const SYNC_TEXT: Record<SyncStatus['state'], string> = {
+  connecting: 'Connecting to cloud sync…',
+  synced: 'Synced across your devices',
+  saving: 'Saving to the cloud…',
+  offline: 'Offline. Changes will sync when you reconnect.',
+  error: 'Cloud sync problem',
+};
+
+export function AccountMenu({ user, syncStatus, onNotifications, onExportImport, onSignOut }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -75,6 +85,16 @@ export function AccountMenu({ user, onNotifications, onExportImport, onSignOut }
               <div className="muted account-email">
                 {user.provider === 'guest' ? 'Not signed in' : user.email ?? 'Google account'}
               </div>
+              {syncStatus ? (
+                <div className={`account-sync sync-${syncStatus.state}`} role="status" title={syncStatus.message}>
+                  <span className="account-sync-dot" aria-hidden />
+                  {syncStatus.state === 'error' && syncStatus.message ? syncStatus.message : SYNC_TEXT[syncStatus.state]}
+                </div>
+              ) : (
+                user.provider === 'guest' && (
+                  <div className="account-sync muted">Sign in with Google to sync across devices</div>
+                )
+              )}
             </div>
           </div>
           <button type="button" role="menuitem" className="account-item" onClick={choose(onNotifications)}>

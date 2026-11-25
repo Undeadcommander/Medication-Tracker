@@ -1,5 +1,6 @@
 // Google sign-in through Firebase Authentication. Identity keeps each account's data
 // separate on this device and supplies the Google profile picture for the account icon.
+import type { FirebaseApp } from 'firebase/app';
 import type { Auth, User as FirebaseUser } from 'firebase/auth';
 // Public Firebase web config (safe to commit: access is controlled by Firebase's authorized domains).
 import committedConfig from '../firebase-config.json';
@@ -22,13 +23,14 @@ const pick = (fromEnv: string | undefined, fromFile: string) => (fromEnv ?? '').
  * Safari requires for redirect sign-in in iPhone/iPad Home Screen apps (no third-party storage there).
  * The Google OAuth client must list https://<that>/__/auth/handler as an authorized redirect URI.
  */
-const SELF_HOSTED_AUTH = env.VITE_FIREBASE_SELF_HOSTED_AUTH === 'true' && location.protocol === 'https:';
-const selfHostedAuthDomain = `${location.host}${env.BASE_URL.replace(/\/+$/, '')}`;
+const SELF_HOSTED_AUTH =
+  env.VITE_FIREBASE_SELF_HOSTED_AUTH === 'true' && typeof location !== 'undefined' && location.protocol === 'https:';
+const selfHostedAuthDomain = () => `${location.host}${env.BASE_URL.replace(/\/+$/, '')}`;
 
 const firebaseConfig = {
   apiKey: pick(env.VITE_FIREBASE_API_KEY, committedConfig.apiKey),
   authDomain: SELF_HOSTED_AUTH
-    ? selfHostedAuthDomain
+    ? selfHostedAuthDomain()
     : pick(env.VITE_FIREBASE_AUTH_DOMAIN, committedConfig.authDomain),
   projectId: pick(env.VITE_FIREBASE_PROJECT_ID, committedConfig.projectId),
   appId: pick(env.VITE_FIREBASE_APP_ID, committedConfig.appId),
@@ -44,16 +46,18 @@ const SESSION_KEY = 'medtracker.session';
 // screen preloads it, so a tap can open Google's popup synchronously (Safari blocks popups that
 // open after an await, i.e. outside the tap's user gesture).
 type AuthModule = typeof import('firebase/auth');
-let loaded: { auth: Auth; mod: AuthModule } | null = null;
-let loadPromise: Promise<{ auth: Auth; mod: AuthModule }> | null = null;
+type Loaded = { app: FirebaseApp; auth: Auth; mod: AuthModule };
+let loaded: Loaded | null = null;
+let loadPromise: Promise<Loaded> | null = null;
 
-function loadFirebase(): Promise<{ auth: Auth; mod: AuthModule }> {
+function loadFirebase(): Promise<Loaded> {
   if (!FIREBASE_CONFIGURED) return Promise.reject(new Error('Firebase is not configured'));
   loadPromise ??= (async () => {
     const [{ initializeApp }, mod] = await Promise.all([import('firebase/app'), import('firebase/auth')]);
-    const auth = mod.getAuth(initializeApp(firebaseConfig));
+    const app = initializeApp(firebaseConfig);
+    const auth = mod.getAuth(app);
     auth.useDeviceLanguage();
-    loaded = { auth, mod };
+    loaded = { app, auth, mod };
     return loaded;
   })().catch((e) => {
     loadPromise = null;
@@ -64,6 +68,11 @@ function loadFirebase(): Promise<{ auth: Auth; mod: AuthModule }> {
 
 function getFirebaseAuth(): Promise<Auth> {
   return loadFirebase().then((x) => x.auth);
+}
+
+/** The shared Firebase app (and its signed-in Auth), for cloud sync. */
+export function getFirebaseApp(): Promise<{ app: FirebaseApp; auth: Auth }> {
+  return loadFirebase().then(({ app, auth }) => ({ app, auth }));
 }
 
 /** Start loading Firebase Auth ahead of the sign-in tap. Resolves when it's ready. */

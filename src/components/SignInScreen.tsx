@@ -102,8 +102,8 @@ export function SignInScreen({ onSignIn, initialError = null }: Props) {
           Continue without an account
         </button>
         <p className="signin-privacy muted">
-          Your medication data stays on this device. Signing in keeps each account's data separate and shows your
-          profile picture. Use encrypted export to move data to another device.
+          Sign in with Google to sync your medications across your devices. Only your account can read them.
+          Without an account, everything stays on this device.
         </p>
         <p className="signin-diag muted" aria-label="Diagnostics">
           Build {BUILD_ID}
