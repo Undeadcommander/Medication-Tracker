@@ -453,8 +453,10 @@ export interface MedEnvelope {
   v: 1;
   iv: string;
   ct: string;
+  /** keyId of the data key it's encrypted with (so leftovers from a key reset can be recognised). */
+  k?: string;
 }
-/** One entry of `logs/{YYYY-MM}.logs` */
+/** One entry of `logs/{docId}.logs` */
 export type LogEnvelope = MedEnvelope;
 
 const FLAG_GZIP = 1;
@@ -477,7 +479,7 @@ function unframe(b: Bytes): { flags: number; payload: Bytes } {
   return { flags: b[0]!, payload: b.slice(5, 5 + len) };
 }
 
-async function encryptJson(dek: CryptoKey, value: unknown, additionalData: Bytes, kind: 'med' | 'log'): Promise<MedEnvelope> {
+async function encryptJson(dek: CryptoKey, value: unknown, additionalData: Bytes, kind: 'med' | 'log', keyId?: string): Promise<MedEnvelope> {
   let payload = utf8(JSON.stringify(value));
   let flags = 0;
   if (kind === 'med' && typeof CompressionStream !== 'undefined') {
@@ -486,7 +488,7 @@ async function encryptJson(dek: CryptoKey, value: unknown, additionalData: Bytes
   }
   const plain = frame(payload, flags, kind === 'med' ? MED_PAD : LOG_PAD, kind === 'log');
   const box = await seal(dek, plain, additionalData);
-  return { v: 1, ...box };
+  return keyId ? { v: 1, ...box, k: keyId } : { v: 1, ...box };
 }
 
 async function decryptJson(dek: CryptoKey, env: unknown, additionalData: Bytes): Promise<unknown> {
@@ -504,8 +506,8 @@ export function isEnvelope(x: unknown): x is MedEnvelope {
   return isRecord(x) && typeof x.iv === 'string' && typeof x.ct === 'string';
 }
 
-export function encryptMed(dek: CryptoKey, uid: string, med: Medication): Promise<MedEnvelope> {
-  return encryptJson(dek, med, medAad(uid, med.id), 'med');
+export function encryptMed(dek: CryptoKey, uid: string, med: Medication, keyId?: string): Promise<MedEnvelope> {
+  return encryptJson(dek, med, medAad(uid, med.id), 'med', keyId);
 }
 
 /** Returns the decrypted (not yet validated) medication. Throws if tampered or wrong key. */
@@ -515,8 +517,9 @@ export async function decryptMed(dek: CryptoKey, uid: string, medId: string, env
   return med;
 }
 
-export function encryptLog(dek: CryptoKey, uid: string, month: string, log: DoseLog): Promise<LogEnvelope> {
-  return encryptJson(dek, log, logAad(uid, month, log.id), 'log');
+/** `doc` is the log's cloud document id (bound into the ciphertext, so it can't be moved). */
+export function encryptLog(dek: CryptoKey, uid: string, doc: string, log: DoseLog, keyId?: string): Promise<LogEnvelope> {
+  return encryptJson(dek, log, logAad(uid, doc, log.id), 'log', keyId);
 }
 
 export async function decryptLog(dek: CryptoKey, uid: string, month: string, logId: string, env: unknown): Promise<unknown> {
@@ -534,19 +537,58 @@ export interface RawDoc {
   data: unknown;
 }
 
+/** `meds/{id}` of a medication deleted for good (no secrets in it, so the rules can check it). */
+export function isMedTombstone(x: unknown): boolean {
+  return isRecord(x) && x.deleted === true && !('ct' in x);
+}
+
 export interface DecodedRemote {
-  /** In the shape syncOps.remoteToAppData expects: `{ med }` and `{ logs: { [id]: log } }`. */
-  medDocs: { med: unknown }[];
-  logDocs: { logs: Record<string, unknown> }[];
+  /** In the shape syncOps.remoteToAppData expects. */
+  meds: { id: string; med: unknown }[];
+  tombstones: string[];
+  logDocs: { id: string; logs: Record<string, unknown> }[];
   /** Items still stored in plaintext (from before encryption): re-upload encrypted, then they're gone. */
-  plaintext: { medIds: string[]; logs: { month: string; id: string }[] };
+  plaintext: { medIds: string[]; logs: { doc: string; id: string }[] };
   /** Ciphertext that failed to decrypt (tampered, damaged, or another key). Skipped, not deleted. */
   undecryptable: number;
   failedIds: { meds: string[]; logs: string[] };
+  /**
+   * Failed items that say they were encrypted with a different (older) key than the current one:
+   * leftovers from a key reset, safe to delete.
+   */
+  staleKey: { meds: string[]; logs: { doc: string; id: string }[] };
+  /** Decryption cache entries added and removed by this decode (to save between launches). */
+  cacheAdded: [string, unknown][];
+  cacheRemoved: string[];
 }
 
 /** Memo of decrypted items, keyed by location + IV (a fresh IV for every encryption). */
 export type DecryptCache = Map<string, unknown>;
+
+interface MedResult {
+  med?: unknown;
+  tomb?: boolean;
+  plaintext?: boolean;
+  failed?: boolean;
+  stale?: boolean;
+  keys: string[];
+}
+interface LogDocResult {
+  logs: Record<string, unknown>;
+  plaintext: string[];
+  failed: string[];
+  stale: string[];
+  keys: string[];
+}
+/**
+ * Results per document object. Sync keeps the data object of a document that didn't change, so an
+ * unchanged document isn't looked at again. Make a new one whenever the key changes.
+ */
+export interface DecodeMemo {
+  meds: WeakMap<object, MedResult>;
+  logs: WeakMap<object, LogDocResult>;
+}
+export const newDecodeMemo = (): DecodeMemo => ({ meds: new WeakMap(), logs: new WeakMap() });
 
 export async function decodeRemote(
   dek: CryptoKey,
@@ -554,66 +596,108 @@ export async function decodeRemote(
   meds: RawDoc[],
   logs: RawDoc[],
   cache: DecryptCache = new Map(),
+  opts: { keyId?: string; memo?: DecodeMemo } = {},
 ): Promise<DecodedRemote> {
+  const { keyId, memo } = opts;
   const out: DecodedRemote = {
-    medDocs: [],
+    meds: [],
+    tombstones: [],
     logDocs: [],
     plaintext: { medIds: [], logs: [] },
     undecryptable: 0,
     failedIds: { meds: [], logs: [] },
+    staleKey: { meds: [], logs: [] },
+    cacheAdded: [],
+    cacheRemoved: [],
   };
   const seen = new Set<string>();
-  const cached = async (key: string, fn: () => Promise<unknown>) => {
-    seen.add(key);
+  const cached = async (key: string, keys: string[], fn: () => Promise<unknown>) => {
+    keys.push(key);
     if (cache.has(key)) return cache.get(key);
     const v = await fn();
     cache.set(key, v);
+    out.cacheAdded.push([key, v]);
     return v;
   };
+  const isStale = (env: MedEnvelope) => typeof env.k === 'string' && !!keyId && env.k !== keyId;
 
-  await Promise.all(
-    meds.map(async ({ id, data }) => {
-      if (isEnvelope(data)) {
-        try {
-          const med = await cached(`m|${id}|${data.iv}|${data.ct.length}`, () => decryptMed(dek, uid, id, data));
-          out.medDocs.push({ med });
-        } catch {
-          out.undecryptable++;
-          out.failedIds.meds.push(id);
+  const medResult = async (id: string, data: unknown): Promise<MedResult> => {
+    const keys: string[] = [];
+    if (isMedTombstone(data)) return { tomb: true, keys };
+    if (isEnvelope(data)) {
+      try {
+        return { med: await cached(`m|${id}|${data.iv}|${data.ct.length}`, keys, () => decryptMed(dek, uid, id, data)), keys };
+      } catch {
+        return { failed: true, stale: isStale(data), keys };
+      }
+    }
+    return { plaintext: true, med: isRecord(data) ? data.med : undefined, keys };
+  };
+
+  const logResult = async (doc: string, data: unknown): Promise<LogDocResult> => {
+    const r: LogDocResult = { logs: {}, plaintext: [], failed: [], stale: [], keys: [] };
+    const entries = isRecord(data) && isRecord(data.logs) ? Object.entries(data.logs) : [];
+    await Promise.all(
+      entries.map(async ([logId, value]) => {
+        if (isEnvelope(value)) {
+          try {
+            r.logs[logId] = await cached(`l|${doc}|${logId}|${value.iv}|${value.ct.length}`, r.keys, () =>
+              decryptLog(dek, uid, doc, logId, value),
+            );
+          } catch {
+            r.failed.push(logId);
+            if (isStale(value)) r.stale.push(logId);
+          }
+        } else {
+          r.plaintext.push(logId);
+          r.logs[logId] = value;
         }
+      }),
+    );
+    return r;
+  };
+
+  await Promise.all([
+    ...meds.map(async ({ id, data }) => {
+      const memoKey = isRecord(data) ? data : null;
+      let r = memoKey ? memo?.meds.get(memoKey) : undefined;
+      if (!r) {
+        r = await medResult(id, data);
+        if (memoKey && !r.failed) memo?.meds.set(memoKey, r);
+      }
+      r.keys.forEach((k) => seen.add(k));
+      if (r.tomb) out.tombstones.push(id);
+      else if (r.failed) {
+        out.undecryptable++;
+        out.failedIds.meds.push(id);
+        if (r.stale) out.staleKey.meds.push(id);
       } else {
-        out.plaintext.medIds.push(id);
-        out.medDocs.push({ med: isRecord(data) ? data.med : undefined });
+        if (r.plaintext) out.plaintext.medIds.push(id);
+        out.meds.push({ id, med: r.med });
       }
     }),
-  );
-
-  await Promise.all(
-    logs.map(async ({ id: month, data }) => {
-      const entries = isRecord(data) && isRecord(data.logs) ? Object.entries(data.logs) : [];
-      const decrypted: Record<string, unknown> = {};
-      await Promise.all(
-        entries.map(async ([logId, value]) => {
-          if (isEnvelope(value)) {
-            try {
-              decrypted[logId] = await cached(`l|${month}|${logId}|${value.iv}|${value.ct.length}`, () =>
-                decryptLog(dek, uid, month, logId, value),
-              );
-            } catch {
-              out.undecryptable++;
-              out.failedIds.logs.push(logId);
-            }
-          } else {
-            out.plaintext.logs.push({ month, id: logId });
-            decrypted[logId] = value;
-          }
-        }),
-      );
-      out.logDocs.push({ logs: decrypted });
+    ...logs.map(async ({ id: doc, data }) => {
+      const memoKey = isRecord(data) ? data : null;
+      let r = memoKey ? memo?.logs.get(memoKey) : undefined;
+      if (!r) {
+        r = await logResult(doc, data);
+        if (memoKey && !r.failed.length) memo?.logs.set(memoKey, r);
+      }
+      r.keys.forEach((k) => seen.add(k));
+      out.undecryptable += r.failed.length;
+      out.failedIds.logs.push(...r.failed);
+      for (const id of r.stale) out.staleKey.logs.push({ doc, id });
+      for (const id of r.plaintext) out.plaintext.logs.push({ doc, id });
+      out.logDocs.push({ id: doc, logs: r.logs });
     }),
-  );
+  ]);
 
   // Keep the memo from growing without bound.
-  for (const k of cache.keys()) if (!seen.has(k)) cache.delete(k);
+  for (const k of cache.keys()) {
+    if (!seen.has(k)) {
+      cache.delete(k);
+      out.cacheRemoved.push(k);
+    }
+  }
   return out;
 }

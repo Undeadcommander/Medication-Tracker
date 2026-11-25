@@ -20,6 +20,8 @@ interface Props {
   onSignIn: (user: User) => void;
   /** Error carried over from a redirect sign-in. */
   initialError?: string | null;
+  /** Informational message, e.g. after deleting an account. */
+  notice?: string | null;
 }
 
 function GoogleLogo() {
@@ -33,7 +35,7 @@ function GoogleLogo() {
   );
 }
 
-export function SignInScreen({ onSignIn, initialError = null }: Props) {
+export function SignInScreen({ onSignIn, initialError = null, notice = null }: Props) {
   const [error, setError] = useState<string | null>(initialError);
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
@@ -77,6 +79,12 @@ export function SignInScreen({ onSignIn, initialError = null }: Props) {
         <img src={`${import.meta.env.BASE_URL}icons/icon.svg`} alt="" width={64} height={64} className="signin-logo" />
         <h1>MedTracker</h1>
         <p className="muted">Keep track of your medications, schedules and reminders, all in one place.</p>
+
+        {notice && (
+          <div className="alert alert-success" role="status">
+            {notice}
+          </div>
+        )}
 
         {FIREBASE_CONFIGURED ? (
           <button type="button" className="btn google-btn" onClick={signIn} disabled={busy || !ready} aria-busy={busy || !ready}>

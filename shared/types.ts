@@ -41,8 +41,14 @@ export interface Medication {
   pharmacy?: string;
   /** Local "YYYY-MM-DD". */
   refillDate?: string;
-  /** Remaining units on hand; decremented when a dose is marked taken. */
+  /**
+   * Units on hand when last counted (at `supplyCountedAt`). What's on hand now is this minus what
+   * doses marked taken since then deducted: see supplyOnHand() in src/lib/supply.ts. Without
+   * `supplyCountedAt` (older versions) it's already the current count.
+   */
   supplyRemaining?: number;
+  /** ISO timestamp `supplyRemaining` was counted at. */
+  supplyCountedAt?: string;
   notes?: string;
   /** Accent colour for the tile (hex). */
   color: string;
@@ -52,6 +58,8 @@ export interface Medication {
   drugInfo?: DrugInfo;
   createdAt: string;
   updatedAt: string;
+  /** When each field (group) last changed, so edits on different devices merge per field. */
+  fieldTimes?: Partial<Record<string, string>>;
 }
 
 export interface DrugInfo {
@@ -82,7 +90,7 @@ export interface DoseLog {
   status: DoseStatus;
   /** ISO timestamp the user acted on it. */
   loggedAt: string;
-  /** Units removed from supply when marked taken (restored exactly on undo/skip). */
+  /** Units this dose removes from supply while it's marked taken. */
   supplyDeducted?: number;
 }
 

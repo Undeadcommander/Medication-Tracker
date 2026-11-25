@@ -92,3 +92,27 @@ describe('nextOccurrence and describe', () => {
     expect(describeSchedule(s)).toBe('Every 2 weeks on Mon, Wed at 9:00 AM');
   });
 });
+
+describe('DST spring-forward', () => {
+  // Run with TZ=America/New_York to exercise the gap; elsewhere these still hold trivially.
+  it('keeps every dose, in order, when a time falls in the skipped hour', () => {
+    const s: Schedule = { ...makeSchedule('daily', '2026-03-01'), useSpecificTimes: true, times: ['02:30', '03:00'] };
+    const occ = occurrencesOn(s, d(2026, 3, 8)).map((o) => o.getTime());
+    expect(occ.length).toBeGreaterThanOrEqual(1);
+    expect([...occ].sort((a, b) => a - b)).toEqual(occ);
+    expect(new Set(occ).size).toBe(occ.length);
+    if (new Date(2026, 2, 8, 2, 30).getHours() !== 2) {
+      // 02:30 doesn't exist: it rolls forward to 03:30, after the 03:00 dose, which must not be dropped.
+      expect(occ).toHaveLength(2);
+      expect(new Date(occ[0]).getHours()).toBe(3);
+      expect(new Date(occ[0]).getMinutes()).toBe(0);
+    }
+  });
+
+  it('nextOccurrence matches the first occurrence and stops at the end date', () => {
+    const s: Schedule = { ...makeSchedule('twice_daily', '2026-01-01'), endDate: '2026-01-10' };
+    const after = d(2026, 1, 3, 12);
+    expect(nextOccurrence(s, after)?.getTime()).toBe(occurrencesBetween(s, new Date(after.getTime() + 1), d(2026, 2, 1))[0].getTime());
+    expect(nextOccurrence(s, d(2026, 1, 10, 22))).toBeNull();
+  });
+});

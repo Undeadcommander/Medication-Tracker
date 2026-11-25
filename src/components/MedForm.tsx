@@ -1,16 +1,20 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { makeSchedule, normalizeTimes } from '../../shared/schedule';
-import type { DrugInfo, Medication } from '../../shared/types';
+import type { DoseLog, DrugInfo, Medication } from '../../shared/types';
 import { fetchDrugInfo, parseStrengthLabel } from '../lib/drugLookup';
 import { MED_COLORS, newId } from '../lib/store';
+import { supplyOnHand } from '../lib/supply';
 import { MedicationNameInput } from './MedicationNameInput';
 import { Modal } from './Modal';
 import { ScheduleEditor } from './ScheduleEditor';
 
 interface Props {
   initial?: Medication;
+  /** All dose logs, to work out the supply on hand for `initial`. */
+  logs: DoseLog[];
   existingCount: number;
-  onSave: (med: Medication) => void;
+  /** `supplyShownAs`: the on-hand count the form opened with (a different value is a new count). */
+  onSave: (med: Medication, supplyShownAs?: number) => void;
   onClose: () => void;
 }
 
@@ -35,9 +39,13 @@ function hasUsefulInfo(info: DrugInfo): boolean {
   return Boolean(info.rxcui || info.genericName || info.purpose || info.indications);
 }
 
-export function MedForm({ initial, existingCount, onSave, onClose }: Props) {
+export function MedForm({ initial, logs, existingCount, onSave, onClose }: Props) {
   const uid = useId();
-  const [med, setMed] = useState<Medication>(() => initial ?? blankMed(existingCount));
+  // The supply field shows (and saves) what's on hand now, not the stored baseline count.
+  const [shownSupply] = useState(() => (initial ? supplyOnHand(initial, logs) : undefined));
+  const [med, setMed] = useState<Medication>(() =>
+    initial ? { ...initial, supplyRemaining: shownSupply } : blankMed(existingCount),
+  );
   const [lookup, setLookup] = useState<'idle' | 'loading' | 'found' | 'none'>(initial?.drugInfo ? 'found' : 'idle');
   const [error, setError] = useState<string | null>(null);
   const lookupFor = useRef<string>(initial?.drugInfo ? initial.name.toLowerCase() : '');
@@ -100,7 +108,7 @@ export function MedForm({ initial, existingCount, onSave, onClose }: Props) {
       prescriber: med.prescriber?.trim() || undefined,
       pharmacy: med.pharmacy?.trim() || undefined,
       schedule,
-    });
+    }, shownSupply);
   };
 
   const info = med.drugInfo;

@@ -257,6 +257,47 @@ export async function signOut(user: User): Promise<void> {
   }
 }
 
+/**
+ * Confirm the account owner is present before deleting the account (Firebase also requires a
+ * recent sign-in for that). Call straight from a tap: the popup must open within the gesture.
+ * Resolves false if the user closed the popup.
+ */
+export async function reauthenticateForDeletion(user: User): Promise<boolean> {
+  const { auth, mod } = loaded ?? (await loadFirebase());
+  const current = auth.currentUser;
+  if (!current || `firebase:${current.uid}` !== user.id) {
+    throw new Error("Couldn't confirm your Google account. Check your connection and try again.");
+  }
+  const provider = new mod.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account', ...(user.email ? { login_hint: user.email } : {}) });
+  try {
+    await mod.reauthenticateWithPopup(current, provider);
+    return true;
+  } catch (e) {
+    const code = (e as { code?: string })?.code;
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return false;
+    if (code === 'auth/user-mismatch') {
+      throw new Error(`That's a different Google account. Choose ${user.email ?? 'the account you signed in with'}.`);
+    }
+    if (code === 'auth/popup-blocked') throw new Error('Your browser blocked the Google pop-up. Allow pop-ups for this site and try again.');
+    throw friendlyError(e);
+  }
+}
+
+/** Delete the signed-in Firebase Authentication account (this also signs it out). */
+export async function deleteFirebaseUser(): Promise<void> {
+  const { auth, mod } = await loadFirebase();
+  if (!auth.currentUser) throw new Error("Couldn't reach your Google account. Check your connection and try again.");
+  try {
+    await mod.deleteUser(auth.currentUser);
+  } catch (e) {
+    if ((e as { code?: string })?.code === 'auth/requires-recent-login') {
+      throw new Error('For your security, Google needs you to confirm your account again. Try once more.');
+    }
+    throw friendlyError(e);
+  }
+}
+
 export function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   return ((parts[0]?.[0] ?? '?') + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase();

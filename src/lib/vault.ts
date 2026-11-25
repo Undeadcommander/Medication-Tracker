@@ -7,6 +7,7 @@
  * No data, passphrase, or key ever leaves the device, and nothing here is logged.
  */
 import type { AppData, DoseLog, DrugInfo, Medication, Schedule } from '../../shared/types';
+import { MED_FIELD_GROUPS, mergeMed } from './supply';
 
 export type VaultErrorCode = 'invalid-file' | 'unsupported-version' | 'wrong-passphrase' | 'invalid-data';
 
@@ -47,8 +48,8 @@ const MAX_FILE_BYTES = 20 * 1024 * 1024;
 /** Upper bound on decompressed plaintext, to defeat decompression bombs. */
 const MAX_PLAINTEXT_BYTES = 64 * 1024 * 1024;
 
-const MAX_MEDICATIONS = 1000;
-const MAX_DOSE_LOGS = 100_000;
+const MAX_MEDICATIONS = 10_000;
+const MAX_DOSE_LOGS = 5_000_000;
 
 // ---------------------------------------------------------------------------------------------
 // Byte helpers
@@ -404,7 +405,7 @@ function validateDrugInfo(x: unknown, path: string): DrugInfo {
   return info;
 }
 
-function validateMedication(x: unknown, path: string): Medication {
+export function validateMedication(x: unknown, path: string): Medication {
   const o = obj(x, path);
   const color = str(o.color, `${path}.color`, 9);
   if (!/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(color)) bad(`${path}.color`, 'must be a hex colour like #0f766e');
@@ -429,13 +430,24 @@ function validateMedication(x: unknown, path: string): Medication {
   if (pharmacy !== undefined) med.pharmacy = pharmacy;
   if (o.refillDate !== undefined && o.refillDate !== '') med.refillDate = dateOnly(o.refillDate, `${path}.refillDate`);
   if (o.supplyRemaining !== undefined) med.supplyRemaining = num(o.supplyRemaining, `${path}.supplyRemaining`, 0, 1_000_000_000);
+  if (o.supplyCountedAt !== undefined && med.supplyRemaining !== undefined) {
+    med.supplyCountedAt = isoTimestamp(o.supplyCountedAt, `${path}.supplyCountedAt`);
+  }
   const notes = optStr(o, 'notes', path, 5000);
   if (notes !== undefined) med.notes = notes;
   if (o.drugInfo !== undefined) med.drugInfo = validateDrugInfo(o.drugInfo, `${path}.drugInfo`);
+  if (o.fieldTimes !== undefined) {
+    const ft = obj(o.fieldTimes, `${path}.fieldTimes`);
+    const times: Record<string, string> = {};
+    for (const g of Object.keys(MED_FIELD_GROUPS)) {
+      if (ft[g] !== undefined) times[g] = isoTimestamp(ft[g], `${path}.fieldTimes.${g}`);
+    }
+    med.fieldTimes = times;
+  }
   return med;
 }
 
-function validateDoseLog(x: unknown, path: string): DoseLog {
+export function validateDoseLog(x: unknown, path: string): DoseLog {
   const o = obj(x, path);
   const log: DoseLog = {
     id: str(o.id, `${path}.id`, 200, { nonEmpty: true }),
@@ -473,13 +485,13 @@ export function validateAppData(x: unknown): AppData {
 // Merge
 // ---------------------------------------------------------------------------------------------
 
-/** Medications by id (newer `updatedAt` wins, ties keep current); dose logs unioned by id (incoming wins). */
+/** Medications by id, merged field by field (newer change wins); one dose log per scheduled dose (newer action wins). */
 export function mergeAppData(current: AppData, incoming: AppData): AppData {
   const meds = new Map<string, Medication>();
   for (const m of current.medications) meds.set(m.id, m);
   for (const m of incoming.medications) {
     const existing = meds.get(m.id);
-    if (!existing || Date.parse(m.updatedAt) > Date.parse(existing.updatedAt)) meds.set(m.id, m);
+    meds.set(m.id, existing ? mergeMed(existing, m) : m); // field by field: the newer change of each wins
   }
   // One log per scheduled dose: the same dose may have been logged separately on each device
   // (different random ids). The more recent action wins; incoming wins a tie.

@@ -94,6 +94,15 @@ function atTime(day: Date, hhmm: string): Date {
   return new Date(day.getFullYear(), day.getMonth(), day.getDate(), h, m, 0, 0);
 }
 
+/** A due day's dose instants, ascending and unique. */
+function dayOccurrences(day: Date, times: string[]): Date[] {
+  const occs = times.map((t) => atTime(day, t));
+  // On a DST spring-forward day a skipped time (e.g. 02:30) rolls forward (to 03:30), which can
+  // put it after a later time (03:00) or onto one (03:30): re-sort and never emit an instant twice.
+  occs.sort((a, b) => a.getTime() - b.getTime());
+  return occs.filter((o, i) => i === 0 || o.getTime() !== occs[i - 1].getTime());
+}
+
 /** All dose occurrences with from <= t < to, ascending. */
 export function occurrencesBetween(s: Schedule, from: Date, to: Date): Date[] {
   const out: Date[] = [];
@@ -102,15 +111,7 @@ export function occurrencesBetween(s: Schedule, from: Date, to: Date): Date[] {
   // Guard against runaway loops on huge ranges.
   for (let i = 0; day < to && i < 3700; i++) {
     if (isDueOn(s, day)) {
-      let prev = -1;
-      for (const t of times) {
-        const occ = atTime(day, t);
-        // On a DST spring-forward day a skipped time (e.g. 02:30) rolls into a later one;
-        // never emit the same instant twice.
-        if (occ.getTime() <= prev) continue;
-        prev = occ.getTime();
-        if (occ >= from && occ < to) out.push(occ);
-      }
+      for (const occ of dayOccurrences(day, times)) if (occ >= from && occ < to) out.push(occ);
     }
     day.setDate(day.getDate() + 1);
   }
@@ -128,10 +129,19 @@ export function occurrencesOn(s: Schedule, day: Date): Date[] {
 /** Next occurrence strictly after `after`, searching up to ~1 year ahead. */
 export function nextOccurrence(s: Schedule, after: Date = new Date()): Date | null {
   const from = new Date(after.getTime() + 1);
-  const horizon = new Date(from);
-  horizon.setDate(horizon.getDate() + 370);
-  const [first] = occurrencesBetween(s, from, horizon).slice(0, 1);
-  return first ?? null;
+  if (s.endDate && daysBetween(from, fromDateKey(s.endDate)) < 0) return null; // already ended
+  const times = effectiveTimes(s);
+  // Walk day by day and stop at the first hit, instead of building a year of occurrences
+  // (this runs for every medication tile on every 30s tick, up to 64 times per tile).
+  const day = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  for (let i = 0; i <= 370; i++) {
+    if (isDueOn(s, day)) {
+      const hit = dayOccurrences(day, times).find((occ) => occ >= from);
+      if (hit) return hit;
+    }
+    day.setDate(day.getDate() + 1);
+  }
+  return null;
 }
 
 export function formatTime12(hhmm: string): string {

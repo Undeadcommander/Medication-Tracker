@@ -347,9 +347,15 @@ function buildReminders(
   const from = new Date(now);
   const to = new Date(now + horizon * 86_400_000);
 
+  // Only logs near or after now can matter (a reminder is for a future dose; "dismissed" looks back
+  // 12h). With a year of history that is most of the array, so skip old ones by comparing the ISO
+  // strings (cheap) before parsing/allocating anything for them.
+  const cutoffIso = new Date(now - 12 * 3_600_000 - 60_000).toISOString();
   const logged = new Set<string>();
   const dismissed: string[] = [];
   for (const log of doseLogs) {
+    const iso = log.scheduledFor;
+    if (iso.length === 24 && iso.charCodeAt(23) === 90 /* 'Z' */ && iso < cutoffIso) continue;
     const ms = Date.parse(log.scheduledFor);
     if (Number.isNaN(ms)) continue;
     const id = `${log.medId}@${ms}`;
@@ -380,7 +386,41 @@ let localTimers: ReturnType<typeof setTimeout>[] = [];
 let lastReminders: PushReminder[] = [];
 let localActive = false;
 let rearmInterval: ReturnType<typeof setInterval> | null = null;
-const shownLocally = new Set<string>();
+/** Reminder keys this tab has shown, with when (pruned, so a long-open tab doesn't grow it forever). */
+const shownLocally = new Map<string, number>();
+/** Shared by all open tabs: each one arms its own local timers, but only one should alert. */
+const SHOWN_KEY = 'medtracker.shownReminders';
+const SHOWN_TTL_MS = 2 * 86_400_000;
+const SHOWN_LOCK = 'medtracker-local-reminder';
+
+/** Claims `key` for this tab. False if this tab or another open tab already showed it. */
+function claimShown(key: string): boolean {
+  const now = Date.now();
+  for (const [k, t] of shownLocally) if (now - t > SHOWN_TTL_MS) shownLocally.delete(k);
+  if (shownLocally.has(key)) return false;
+  shownLocally.set(key, now);
+  try {
+    const raw = JSON.parse(localStorage.getItem(SHOWN_KEY) ?? '{}') as Record<string, unknown>;
+    const shared: Record<string, number> = {};
+    for (const [k, t] of Object.entries(raw ?? {})) if (typeof t === 'number' && now - t <= SHOWN_TTL_MS) shared[k] = t;
+    if (key in shared) return false;
+    shared[key] = now;
+    localStorage.setItem(SHOWN_KEY, JSON.stringify(shared));
+  } catch {
+    /* storage unavailable: dedupe within this tab only */
+  }
+  return true;
+}
+
+async function claimShownAcrossTabs(key: string): Promise<boolean> {
+  const claim = async () => claimShown(key);
+  try {
+    // Serialise the read-check-write across tabs whose timers fire at the same moment.
+    return typeof navigator !== 'undefined' && navigator.locks ? await navigator.locks.request(SHOWN_LOCK, claim) : claim();
+  } catch {
+    return claim();
+  }
+}
 
 function clearLocalTimers(): void {
   for (const t of localTimers) clearTimeout(t);
@@ -400,8 +440,7 @@ function notificationData(r: PushReminder) {
 
 /** `key` dedupes; the notification itself always describes the original dose `r`. */
 async function showLocal(r: PushReminder, key = r.id): Promise<void> {
-  if (shownLocally.has(key)) return;
-  shownLocally.add(key);
+  if (!(await claimShownAcrossTabs(key))) return;
   try {
     const reg = await activeRegistration();
     if (!reg || Notification.permission !== 'granted') return;
@@ -466,7 +505,11 @@ function listenForLocalSnooze(): void {
     const r = d.reminder;
     const minutes = Math.min(120, Math.max(1, Number(d.minutes) || 10));
     const key = `${r.id}#snooze@${Date.now()}`;
-    snoozeTimers.push(setTimeout(() => void showLocal(r, key), minutes * 60_000));
+    const timer = setTimeout(() => {
+      snoozeTimers = snoozeTimers.filter((t) => t !== timer);
+      void showLocal(r, key);
+    }, minutes * 60_000);
+    snoozeTimers.push(timer);
   });
 }
 
@@ -577,6 +620,106 @@ export async function sendTestNotification(): Promise<void> {
     icon: ICON,
     badge: ICON,
   });
+}
+
+// ---------- pending "Mark as taken" from notifications ----------
+//
+// The service worker hands a "taken" tap to one open window (or opens the app with ?take=&at=). That
+// window may be on the sign-in screen, still loading its data, or not yet have received the
+// medication from the cloud, so takes are queued durably (shared by all tabs) and applied once a
+// tracker that has the medication loaded claims them.
+
+export interface PendingTake {
+  medId: string;
+  scheduledFor: string;
+  /** When it was queued (ms). */
+  at: number;
+}
+
+const PENDING_KEY = 'medtracker.pendingTakes';
+const PENDING_TTL_MS = 2 * 86_400_000;
+const PENDING_LOCK = 'medtracker-pending-takes';
+const PENDING_EVENT = 'medtracker:pending-takes';
+/** Fallback when localStorage is unavailable (dedupes within this tab only). */
+let memoryPending: PendingTake[] = [];
+
+function readPending(): PendingTake[] {
+  let parsed: unknown;
+  try {
+    const raw = localStorage.getItem(PENDING_KEY);
+    if (!raw) return [];
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = memoryPending;
+  }
+  if (!Array.isArray(parsed)) return [];
+  const now = Date.now();
+  return parsed.filter(
+    (t): t is PendingTake =>
+      !!t &&
+      typeof t.medId === 'string' &&
+      typeof t.scheduledFor === 'string' &&
+      typeof t.at === 'number' &&
+      now - t.at <= PENDING_TTL_MS,
+  );
+}
+
+function writePending(list: PendingTake[]): void {
+  try {
+    if (list.length) localStorage.setItem(PENDING_KEY, JSON.stringify(list));
+    else localStorage.removeItem(PENDING_KEY);
+  } catch {
+    memoryPending = list;
+  }
+}
+
+/** Serialises read-modify-write across tabs. */
+async function withPendingLock<T>(fn: () => T): Promise<T> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.locks) return await navigator.locks.request(PENDING_LOCK, async () => fn());
+  } catch {
+    /* fall through */
+  }
+  return fn();
+}
+
+/** Remember a "mark as taken" until a loaded tracker with this medication applies it. */
+export async function queuePendingTake(medId: string, scheduledFor: string): Promise<void> {
+  if (!medId || medId.length > 200 || Number.isNaN(Date.parse(scheduledFor))) return;
+  await withPendingLock(() => {
+    const list = readPending();
+    if (!list.some((t) => t.medId === medId && t.scheduledFor === scheduledFor)) list.push({ medId, scheduledFor, at: Date.now() });
+    writePending(list);
+  });
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(PENDING_EVENT));
+}
+
+/**
+ * Removes and returns the queued takes that `match`. Atomic across tabs, so each take is handed
+ * to exactly one caller (who must apply it).
+ */
+export async function claimPendingTakes(match: (t: PendingTake) => boolean): Promise<PendingTake[]> {
+  if (!readPending().some(match)) return []; // common case: nothing queued, no lock needed
+  return withPendingLock(() => {
+    const list = readPending();
+    const mine = list.filter(match);
+    if (mine.length) writePending(list.filter((t) => !match(t)));
+    return mine;
+  });
+}
+
+/** Called when takes are queued, from this tab or another one. */
+export function onPendingTakesChange(handler: () => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const onStorage = (e: StorageEvent) => {
+    if (e.key === null || e.key === PENDING_KEY) handler();
+  };
+  window.addEventListener(PENDING_EVENT, handler);
+  window.addEventListener('storage', onStorage);
+  return () => {
+    window.removeEventListener(PENDING_EVENT, handler);
+    window.removeEventListener('storage', onStorage);
+  };
 }
 
 // ---------- messages from the service worker ----------

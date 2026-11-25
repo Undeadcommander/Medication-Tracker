@@ -225,7 +225,7 @@ describe('validateAppData', () => {
   });
 
   it('caps array sizes', () => {
-    const many = Array.from({ length: 1001 }, (_, i) => med(`m${i}`));
+    const many = Array.from({ length: 10_001 }, (_, i) => med(`m${i}`));
     expect(() => validateAppData({ version: 1, medications: many, doseLogs: [] })).toThrow(VaultError);
   });
 
@@ -247,7 +247,7 @@ describe('validateAppData', () => {
 });
 
 describe('mergeAppData', () => {
-  it('newer updatedAt wins; ties keep current; new meds are added', () => {
+  it('newer updatedAt wins; ties pick the same side either way; new meds are added', () => {
     const current: AppData = {
       version: 1,
       medications: [
@@ -268,7 +268,9 @@ describe('mergeAppData', () => {
       doseLogs: [],
     };
     const merged = mergeAppData(current, incoming);
-    expect(merged.medications.map((m) => m.name)).toEqual(['inc-a', 'cur-b', 'cur-c', 'inc-d']);
+    expect(merged.medications.map((m) => m.name)).toEqual(['inc-a', 'cur-b', 'inc-c', 'inc-d']);
+    // A tie resolves the same whichever copy is merged into which (so devices agree).
+    expect(mergeAppData(incoming, current).medications.find((m) => m.id === 'c')?.name).toBe('inc-c');
   });
 
   it('unions dose logs per scheduled dose with incoming winning ties', () => {

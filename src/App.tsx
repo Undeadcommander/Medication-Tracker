@@ -1,17 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { AppData, Medication } from '../shared/types';
+import type { AppData, DoseStatus, Medication } from '../shared/types';
 import { AccountMenu } from './components/AccountMenu';
+import { DeleteAccountDialog } from './components/DeleteAccountDialog';
 import { ExportImportDialog } from './components/ExportImportDialog';
 import { MedDetail } from './components/MedDetail';
 import { MedForm } from './components/MedForm';
-import { MedTile } from './components/MedTile';
+import { MedGrid } from './components/MedTile';
 import { NotificationSettings } from './components/NotificationSettings';
 import { SignInScreen } from './components/SignInScreen';
 import { SyncEncryptionDialog } from './components/SyncEncryptionDialog';
 import { TodayPanel } from './components/TodayPanel';
+import { wipeAfterAccountDeleted } from './lib/account';
 import { clearSession, completeRedirectSignIn, loadSession, saveSession, signOut, watchAuth, type User } from './lib/auth';
-import { getPushState, onServiceWorkerMessage, registerServiceWorker, syncReminders } from './lib/push';
-import { adoptGuestData, loadPrefs, savePrefs, useAppData } from './lib/store';
+import {
+  claimPendingTakes,
+  getPushState,
+  onPendingTakesChange,
+  onServiceWorkerMessage,
+  queuePendingTake,
+  registerServiceWorker,
+  syncReminders,
+} from './lib/push';
+import { loadPrefs, savePrefs, useAppData } from './lib/store';
 import { clearSyncCache } from './lib/sync';
 import { mergeAppData } from './lib/vault';
 
@@ -22,7 +32,10 @@ type Dialog =
   | { kind: 'notifications' }
   | { kind: 'vault' }
   | { kind: 'encryption' }
+  | { kind: 'delete' }
   | null;
+
+const NAME_ORDER = new Intl.Collator(undefined, { sensitivity: 'base' });
 
 /** Re-render every 30s so "due"/"next dose" labels stay current. */
 function useNow(intervalMs = 30_000): Date {
@@ -42,11 +55,27 @@ function useNow(intervalMs = 30_000): Date {
 export default function App() {
   const [user, setUser] = useState<User | null>(() => loadSession());
   const [authError, setAuthError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const handleSignIn = useCallback((u: User) => {
-    if (u.provider === 'google') adoptGuestData(u.id);
+    setNotice(null);
     saveSession(u);
     setUser(u);
+  }, []);
+
+  // Service worker + "Mark as taken" from notifications. Takes are queued here, at the top, so they
+  // aren't lost on the sign-in screen or while data is still loading; the Tracker applies them.
+  useEffect(() => {
+    registerServiceWorker();
+    const off = onServiceWorkerMessage((msg) => void queuePendingTake(msg.medId, msg.scheduledFor));
+    const params = new URLSearchParams(location.search);
+    const take = params.get('take');
+    const at = params.get('at');
+    if (take && at) {
+      void queuePendingTake(take, at);
+      history.replaceState(null, '', location.pathname);
+    }
+    return off;
   }, []);
 
   // Firebase is the source of truth for Google sessions: it picks up redirect sign-ins,
@@ -57,7 +86,6 @@ export default function App() {
       setUser((current) => {
         if (fbUser) {
           if (current?.provider === 'guest') return current; // guest chose not to sign in on this device
-          if (current?.id !== fbUser.id) adoptGuestData(fbUser.id);
           saveSession(fbUser);
           return fbUser;
         }
@@ -70,7 +98,7 @@ export default function App() {
     });
   }, []);
 
-  if (!user) return <SignInScreen onSignIn={handleSignIn} initialError={authError} />;
+  if (!user) return <SignInScreen onSignIn={handleSignIn} initialError={authError} notice={notice} />;
   return (
     <Tracker
       key={user.id}
@@ -83,16 +111,35 @@ export default function App() {
           setUser(null);
         }
       }}
+      onAccountDeleted={(message) => {
+        setNotice(message);
+        setUser(null);
+      }}
     />
   );
 }
 
-function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
+function Tracker({
+  user,
+  onSignOut,
+  onAccountDeleted,
+}: {
+  user: User;
+  onSignOut: () => void;
+  /** The account (or a guest's data) was deleted, here or on another device. */
+  onAccountDeleted: (message: string) => void;
+}) {
   // Google accounts sync through Firestore; the Firebase uid follows the "firebase:" prefix.
   const syncUid = user.provider === 'google' && user.id.startsWith('firebase:') ? user.id.slice('firebase:'.length) : undefined;
-  const { data, saveError, syncStatus, syncControls, saveMedication, deleteMedication, logDose, undoDose, replaceData } = useAppData(
+  const { data, loaded, saveError, syncStatus, syncControls, saveMedication, deleteMedication, logDose, undoDose, replaceData } = useAppData(
     user.id,
     syncUid,
+    // Deleted on another device: remove this device's copy too.
+    () => {
+      void wipeAfterAccountDeleted(user).finally(() =>
+        onAccountDeleted('This account was deleted, so its data was removed from this device too.'),
+      );
+    },
   );
   const [dialog, setDialog] = useState<Dialog>(null);
   const [prefs, setPrefs] = useState(loadPrefs);
@@ -104,38 +151,50 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   const encryptionPrompted = useRef(false);
   const logDoseRef = useRef(logDose);
   logDoseRef.current = logDose;
+  const undoDoseRef = useRef(undoDose);
+  undoDoseRef.current = undoDose;
+
+  // Stable callbacks, so memoised children (tiles, today rows) aren't re-rendered by unrelated state.
+  const onLog = useCallback((medId: string, key: string, status: DoseStatus) => logDoseRef.current(medId, key, status), []);
+  const onUndo = useCallback((medId: string, key: string) => undoDoseRef.current(medId, key), []);
+  const onOpenMed = useCallback((id: string) => setDialog({ kind: 'detail', id }), []);
 
   const meds = useMemo(
-    () => [...data.medications].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
+    () => [...data.medications].sort((a, b) => NAME_ORDER.compare(a.name, b.name)),
     [data.medications],
   );
-  const notifMeds = meds.filter((m) => m.notificationsEnabled).length;
+  const notifMeds = useMemo(() => meds.filter((m) => m.notificationsEnabled).length, [meds]);
 
-  // Service worker + "Mark as taken" from notifications.
+  // Apply "Mark as taken" taps from notifications once this tracker has loaded and has the
+  // medication (cloud data may still be arriving). Claiming removes a take from the list shared by
+  // all tabs, so only one tab applies it.
   useEffect(() => {
-    registerServiceWorker();
-    const off = onServiceWorkerMessage((msg) => {
-      if (msg.type === 'dose-taken') logDoseRef.current(msg.medId, msg.scheduledFor, 'taken');
-    });
-    const params = new URLSearchParams(location.search);
-    const take = params.get('take');
-    const at = params.get('at');
-    if (take && at) {
-      logDoseRef.current(take, at, 'taken');
-      history.replaceState(null, '', location.pathname);
-    }
-    return off;
-  }, []);
+    if (!loaded) return;
+    const ids = new Set(data.medications.map((m) => m.id));
+    const drain = () => {
+      void claimPendingTakes((t) => ids.has(t.medId)).then((claimed) => {
+        for (const t of claimed) logDoseRef.current(t.medId, t.scheduledFor, 'taken');
+      });
+    };
+    drain();
+    return onPendingTakesChange(drain);
+  }, [loaded, data.medications]);
 
   // Keep scheduled reminders in sync with medications, logs and preferences.
+  // Not before the data has loaded: an empty list would clear this device's reminders.
   useEffect(() => {
+    if (!loaded) return;
     const t = setTimeout(() => {
       syncReminders(data.medications, data.doseLogs, { discreet: prefs.discreetNotifications })
         .then(setLastSync)
         .catch(() => setLastSync(null));
     }, 800);
     return () => clearTimeout(t);
-  }, [data.medications, data.doseLogs, prefs.discreetNotifications, syncTick]);
+  }, [loaded, data.medications, data.doseLogs, prefs.discreetNotifications, syncTick]);
+
+  // Signed out or switched account: stop this account's reminders (here and on the push server),
+  // so its medication names don't keep appearing in notifications.
+  useEffect(() => () => void syncReminders([], []).catch(() => {}), []);
 
   // Encrypted sync needs setting up or unlocking on this device: ask once per session.
   useEffect(() => {
@@ -151,8 +210,8 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
     getPushState().then((s) => setNeedsNotifSetup(s === 'default' || s === 'ios-needs-install'));
   }, [notifMeds, syncTick]);
 
-  const onSave = (med: Medication) => {
-    saveMedication(med);
+  const onSave = (med: Medication, supplyShownAs?: number) => {
+    saveMedication(med, supplyShownAs);
     setDialog({ kind: 'detail', id: med.id });
   };
 
@@ -191,7 +250,11 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
             onNotifications={() => setDialog({ kind: 'notifications' })}
             onExportImport={() => setDialog({ kind: 'vault' })}
             onEncryption={syncUid ? () => setDialog({ kind: 'encryption' }) : undefined}
-            onSignOut={onSignOut}
+            onSignOut={() => {
+              syncControls?.stop(); // before sign-out clears this device's sync data
+              onSignOut();
+            }}
+            onDeleteAccount={() => setDialog({ kind: 'delete' })}
           />
         </div>
       </header>
@@ -232,7 +295,11 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
           </div>
         )}
 
-        {meds.length === 0 ? (
+        {!loaded ? (
+          <p className="muted" role="status">
+            Loading…
+          </p>
+        ) : meds.length === 0 ? (
           <section className="empty card">
             <div className="empty-icon" aria-hidden>
               💊
@@ -247,34 +314,24 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
           </section>
         ) : (
           <>
-            <TodayPanel
-              meds={meds}
-              logs={data.doseLogs}
-              now={now}
-              onLog={logDose}
-              onUndo={undoDose}
-              onOpenMed={(id) => setDialog({ kind: 'detail', id })}
-            />
+            <TodayPanel meds={meds} logs={data.doseLogs} now={now} onLog={onLog} onUndo={onUndo} onOpenMed={onOpenMed} />
             <section aria-labelledby="meds-title">
               <h2 id="meds-title" className="section-title">
                 Your medications <span className="muted">({meds.length})</span>
               </h2>
-              <div className="tiles">
-                {meds.map((m) => (
-                  <MedTile key={m.id} med={m} logs={data.doseLogs} now={now} onOpen={() => setDialog({ kind: 'detail', id: m.id })} />
-                ))}
-              </div>
+              <MedGrid meds={meds} logs={data.doseLogs} now={now} onOpen={onOpenMed} />
             </section>
           </>
         )}
       </main>
 
       {dialog?.kind === 'add' && (
-        <MedForm existingCount={data.medications.length} onSave={onSave} onClose={() => setDialog(null)} />
+        <MedForm logs={data.doseLogs} existingCount={data.medications.length} onSave={onSave} onClose={() => setDialog(null)} />
       )}
       {editMed && (
         <MedForm
           initial={editMed}
+          logs={data.doseLogs}
           existingCount={data.medications.length}
           onSave={onSave}
           onClose={() => setDialog({ kind: 'detail', id: editMed.id })}
@@ -312,6 +369,23 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
       )}
       {dialog?.kind === 'encryption' && (
         <SyncEncryptionDialog status={syncStatus} controls={syncControls} onClose={() => setDialog(null)} />
+      )}
+      {dialog?.kind === 'delete' && (
+        <DeleteAccountDialog
+          user={user}
+          sync={syncControls}
+          medicationCount={data.medications.length}
+          doseLogCount={data.doseLogs.length}
+          onExport={() => setDialog({ kind: 'vault' })}
+          onDeleted={() =>
+            onAccountDeleted(
+              user.provider === 'google'
+                ? 'Your account and all of its data have been deleted.'
+                : 'All data on this device has been deleted.',
+            )
+          }
+          onClose={() => setDialog(null)}
+        />
       )}
       {dialog?.kind === 'vault' && <ExportImportDialog data={data} onImport={onImport} onClose={() => setDialog(null)} />}
     </div>

@@ -372,6 +372,9 @@
   text-align: left;
   cursor: pointer;
   transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+  /* Off-screen tiles skip layout and paint (matters with hundreds of medications). */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 260px;
 }
 .tile:hover {
   transform: translateY(-2px);
@@ -987,4 +990,27 @@
   height: 20px;
   margin-top: 1px;
   flex: none;
+}
+
+/* ---------- Account deletion ---------- */
+.account-item-danger {
+  color: var(--danger);
+}
+.account-item-danger:hover,
+.account-item-danger:focus-visible {
+  background: var(--danger-soft);
+}
+.btn-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.btn-link:disabled {
+  cursor: default;
+  opacity: 0.6;
 }

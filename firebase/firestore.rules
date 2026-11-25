@@ -2,9 +2,16 @@ rules_version = '2';
 
 // MedTracker cloud sync (end-to-end encrypted). Each signed-in Google account can read and write
 // only its own data:
-//   users/{uid}/meds/{medId}       one document per medication: { v, iv, ct } (ciphertext only)
-//   users/{uid}/logs/{YYYY-MM}     dose history, one document per month: { logs: { [logId]: { v, iv, ct } } }
-//   users/{uid}/meta/crypto        the wrapped data key (no secrets in readable form)
+//   users/{uid}/meds/{medId}             one document per medication: { v, iv, ct, k? } (ciphertext
+//                                        only), or { v: 1, deleted: true } once it's deleted (final)
+//   users/{uid}/logs/{YYYY-MM}~{shard}   dose history, one document per month and shard (by
+//                                        medication): { logs: { [logId]: { v, iv, ct, k? } }, w }
+//                                        where w lists the entries the last write changed
+//   users/{uid}/logs/{YYYY-MM}           dose history written by older versions (being moved into
+//                                        the shard documents, so it only needs to shrink)
+//   users/{uid}/meta/crypto              the wrapped data key (no secrets in readable form), or
+//                                        { v: 1, deleted: true, ... } while the account is being
+//                                        deleted, and permanently ({ done: true }) once it has been
 // Everything else is denied.
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -13,21 +20,77 @@ service cloud.firestore {
         return request.auth != null && request.auth.uid == uid;
       }
 
-      allow read, delete: if isOwner() && collection in ['meds', 'logs', 'meta'];
+      function metaPath() {
+        return /databases/$(database)/documents/users/$(uid)/meta/crypto;
+      }
 
-      // Medications must be ciphertext, so an outdated app can't upload them in plaintext.
-      allow create, update: if isOwner() && collection == 'meds'
-        && request.resource.data.keys().hasOnly(['v', 'iv', 'ct'])
-        && request.resource.data.v == 1
-        && request.resource.data.iv is string
-        && request.resource.data.ct is string;
+      // Deleted, or being deleted: no new data may be written (by any device).
+      function accountClosed() {
+        return exists(metaPath()) && get(metaPath()).data.get('deleted', false) == true;
+      }
 
-      allow create, update: if isOwner() && collection == 'logs'
-        && request.resource.data.keys().hasOnly(['logs'])
-        && request.resource.data.logs is map;
+      function isEnvelope(x) {
+        return x is map
+          && x.keys().hasAll(['v', 'iv', 'ct'])
+          && x.keys().hasOnly(['v', 'iv', 'ct', 'k'])
+          && x.v == 1
+          && x.iv is string
+          && x.ct is string
+          && (!('k' in x) || x.k is string);
+      }
 
+      function isMedTombstone(d) {
+        return d.keys().hasOnly(['v', 'deleted']) && d.v == 1 && d.deleted == true;
+      }
+
+      function isShard(id) {
+        return id.matches('^([0-9]{4}-[0-9]{2}|unknown)~[0-9a-v]$');
+      }
+
+      function isLegacyLogDoc(id) {
+        return id.matches('^([0-9]{4}-[0-9]{2}|unknown)$');
+      }
+
+      // An entry this write adds or changes must be ciphertext (a removed one is fine).
+      function entryOk(logs, keys, i) {
+        return keys.size() <= i || !(keys[i] in logs) || isEnvelope(logs[keys[i]]);
+      }
+
+      // Shard documents: each write lists the (at most 8) entries it changes in `w` (rules can't
+      // loop over a map), every change must be listed, and each listed entry is checked.
+      function shardWriteOk() {
+        let d = request.resource.data;
+        let before = resource == null ? {} : resource.data.get('logs', {});
+        let w = d.get('w', []);
+        return d.keys().hasOnly(['logs', 'w'])
+          && w is list && w.size() <= 8
+          && d.logs.diff(before).affectedKeys().hasOnly(w)
+          && entryOk(d.logs, w, 0) && entryOk(d.logs, w, 1) && entryOk(d.logs, w, 2) && entryOk(d.logs, w, 3)
+          && entryOk(d.logs, w, 4) && entryOk(d.logs, w, 5) && entryOk(d.logs, w, 6) && entryOk(d.logs, w, 7);
+      }
+
+      allow read: if isOwner() && collection in ['meds', 'logs', 'meta'];
+
+      // Account deletion and key reset remove documents.
+      allow delete: if isOwner() && collection in ['meds', 'logs'];
+      allow delete: if isOwner() && collection == 'meta' && resource.data.get('done', false) != true;
+
+      // Medications must be ciphertext (so an outdated app can't upload them in plaintext), and a
+      // deleted medication stays deleted (so a device that was offline can't bring it back).
+      allow create, update: if isOwner() && collection == 'meds' && !accountClosed()
+        && (isEnvelope(request.resource.data) || isMedTombstone(request.resource.data))
+        && (resource == null || resource.data.get('deleted', false) != true);
+
+      allow create, update: if isOwner() && collection == 'logs' && !accountClosed()
+        && request.resource.data.logs is map
+        && request.resource.data.logs.size() <= 5000
+        && ((isShard(docId) && shardWriteOk())
+          || (isLegacyLogDoc(docId) && request.resource.data.keys().hasOnly(['logs'])));
+
+      // Once an account's deletion is done, the marker is permanent.
       allow create, update: if isOwner() && collection == 'meta' && docId == 'crypto'
-        && request.resource.data.v == 1;
+        && request.resource.data.v == 1
+        && (resource == null || resource.data.get('done', false) != true);
     }
   }
 }

@@ -55,8 +55,17 @@ self.addEventListener('message', (event) => {
   event.waitUntil(self.registration.showNotification(title, notificationOptions({ ...msg, tag })));
 });
 
-async function focusOrOpen(url) {
+/**
+ * This app's open windows. matchAll returns every same-origin window, and on GitHub Pages the
+ * origin (user.github.io) is shared with the owner's other sites, so keep only ones in our scope.
+ */
+async function appWindows() {
   const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  return all.filter((client) => client.url.startsWith(SCOPE));
+}
+
+async function focusOrOpen(url) {
+  const all = await appWindows();
   for (const client of all) {
     if ('focus' in client) {
       await client.focus();
@@ -89,7 +98,7 @@ async function handleClick(event) {
     if (!snoozed) {
       // Local mode (no push subscription, or server unreachable): let an open app window
       // re-show it in 10 minutes. Local reminders only run while the app is open anyway.
-      const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      const all = await appWindows();
       // One window only, so several open tabs don't each re-show it.
       if (all.length) {
         all[0].postMessage({ type: 'snooze-local', reminder: data.reminder, minutes: 10 });
@@ -105,7 +114,7 @@ async function handleClick(event) {
   }
 
   if (action === 'take' && data.medId && data.scheduledFor) {
-    const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const all = await appWindows();
     if (all.length) {
       const client = all[0];
       client.postMessage({ type: 'dose-taken', medId: data.medId, scheduledFor: data.scheduledFor });

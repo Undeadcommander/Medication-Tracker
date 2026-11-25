@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { makeSchedule } from '../../shared/schedule';
-import type { DoseLog, Medication } from '../../shared/types';
+import type { AppData, DoseLog, Medication } from '../../shared/types';
 import {
   SyncCryptoError,
   changePassphrase,
@@ -18,9 +18,10 @@ import {
   regenerateRecoveryKey,
   unlockWithPassphrase,
   unlockWithRecoveryKey,
+  newDecodeMemo,
   type CryptoMeta,
 } from './syncCrypto';
-import { keepLocalForFailed, logMonth, migrationOps, remoteToAppData } from './syncOps';
+import { logDocId, logMonth, migrationRefs, reconcile, remoteToAppData, resolveRefs, type SyncOp } from './syncOps';
 
 // Fewer PBKDF2 iterations than production so the suite stays quick; the code path is the same.
 const IT = 100_000;
@@ -208,9 +209,9 @@ describe('document encryption', () => {
 });
 
 describe('decodeRemote + migration', () => {
-  it('decrypts what it can, skips and counts what it cannot, and finds plaintext stragglers', async () => {
-    const { dek } = await bundleP;
-    const good = await encryptMed(dek, UID, med('a'));
+  it('decrypts what it can, skips and counts what it cannot, and finds plaintext stragglers and tombstones', async () => {
+    const { dek, meta } = await bundleP;
+    const good = await encryptMed(dek, UID, med('a'), meta.keyId);
     const swapped = await encryptMed(dek, UID, med('z')); // stored under the wrong doc id
     const l1 = await encryptLog(dek, UID, '2026-02', log('1'));
     const decoded = await decodeRemote(
@@ -220,90 +221,105 @@ describe('decodeRemote + migration', () => {
         { id: 'a', data: good },
         { id: 'b', data: swapped },
         { id: 'p', data: { med: med('p'), updatedAt: '2026-01-01T00:00:00.000Z' } },
+        { id: 'gone', data: { v: 1, deleted: true } },
       ],
       [{ id: '2026-02', data: { logs: { '1': l1, '2': log('2', { medId: 'p', scheduledFor: '2026-02-11T14:00:00.000Z' }), '3': { ...l1, ct: 'AAAA' + l1.ct.slice(4) } } } }],
+      new Map(),
+      { keyId: meta.keyId },
     );
+    expect(good.k).toBe(meta.keyId);
     expect(decoded.undecryptable).toBe(2);
-    expect(decoded.plaintext).toEqual({ medIds: ['p'], logs: [{ month: '2026-02', id: '2' }] });
+    expect(decoded.tombstones).toEqual(['gone']);
+    expect(decoded.plaintext).toEqual({ medIds: ['p'], logs: [{ doc: '2026-02', id: '2' }] });
 
-    const remote = remoteToAppData(decoded.medDocs, decoded.logDocs);
+    const remote = remoteToAppData(decoded);
     expect(remote.data.medications.map((m) => m.id).sort()).toEqual(['a', 'p']);
     expect(remote.data.doseLogs.map((l) => l.id).sort()).toEqual(['1', '2']);
   });
 
-  it('migrates plaintext to encrypted documents and is idempotent once done', async () => {
+  it('recognises leftovers encrypted with an older key', async () => {
+    const { dek, meta } = await bundleP;
+    const other = await createKeyBundle(UID, PASS, IT);
+    const old = await encryptMed(other.dek, UID, med('a'), other.meta.keyId);
+    const decoded = await decodeRemote(dek, UID, [{ id: 'a', data: old }], [], new Map(), { keyId: meta.keyId });
+    expect(decoded.staleKey.meds).toEqual(['a']);
+  });
+
+  it('skips unchanged documents using the memo', async () => {
     const { dek } = await bundleP;
-    // The cloud as the pre-encryption app left it.
+    const data = await encryptMed(dek, UID, med('a'));
+    const memo = newDecodeMemo();
+    const cache = new Map();
+    const first = await decodeRemote(dek, UID, [{ id: 'a', data }], [], cache, { memo });
+    expect(first.cacheAdded).toHaveLength(1);
+    const second = await decodeRemote(dek, UID, [{ id: 'a', data }], [], cache, { memo });
+    expect(second.cacheAdded).toHaveLength(0);
+    expect(second.meds[0]!.med).toBe(first.meds[0]!.med);
+  });
+
+  it('moves plaintext and monthly documents into encrypted shard documents, and is idempotent once done', async () => {
+    const { dek } = await bundleP;
+    // The cloud as older versions left it: plaintext, and one document per month.
     const meds: Record<string, unknown> = {
       a: { med: med('a'), updatedAt: '2026-01-01T00:00:00.000Z' },
       bad: { med: { id: 'bad' } },
     };
-    const months: Record<string, Record<string, unknown>> = {
+    const docs: Record<string, Record<string, unknown>> = {
       '2026-02': {
         '1': log('1'),
         '2': log('2', { scheduledFor: '2026-03-05T14:00:00.000Z' }), // filed under the wrong month
         orphan: log('orphan', { medId: 'gone' }),
+        enc: await encryptLog(dek, UID, '2026-02', log('enc', { scheduledFor: '2026-02-12T14:00:00.000Z' })),
       },
     };
     const snapshot = () => ({
       meds: Object.entries(meds).map(([id, data]) => ({ id, data })),
-      logs: Object.entries(months).map(([id, logs]) => ({ id, data: { logs } })),
+      logs: Object.entries(docs).map(([id, logs]) => ({ id, data: { logs } })),
     });
-
     // Apply ops the way sync.ts writes them (encrypting on the way).
-    const apply = async (ops: ReturnType<typeof migrationOps>) => {
+    const apply = async (ops: SyncOp[]) => {
       for (const op of ops) {
         if (op.kind === 'setMed') meds[op.med.id] = await encryptMed(dek, UID, op.med);
-        else if (op.kind === 'deleteMed') delete meds[op.id];
+        else if (op.kind === 'deleteMed') meds[op.id] = { v: 1, deleted: true };
         else if (op.kind === 'setLog') {
-          const m = logMonth(op.log.scheduledFor);
-          (months[m] ??= {})[op.log.id] = await encryptLog(dek, UID, m, op.log);
-        } else delete months[op.month ?? logMonth(op.log.scheduledFor)]?.[op.log.id];
+          const d = logDocId(op.log);
+          (docs[d] ??= {})[op.log.id] = await encryptLog(dek, UID, d, op.log);
+        } else delete docs[op.doc]?.[op.id];
       }
     };
-
-    const s1 = snapshot();
-    const d1 = await decodeRemote(dek, UID, s1.meds, s1.logs);
-    const r1 = remoteToAppData(d1.medDocs, d1.logDocs);
-    const before = r1.data;
-    const ops = migrationOps(r1, d1.plaintext);
-    expect(ops.map((o) => o.kind).sort()).toEqual(['deleteLog', 'deleteLog', 'deleteMed', 'setLog', 'setLog', 'setMed']);
-
-    // Interrupted halfway: only the first ops were written. Running again finishes the job.
-    await apply(ops.slice(0, 2));
-    const s2 = snapshot();
-    const d2 = await decodeRemote(dek, UID, s2.meds, s2.logs);
-    await apply(migrationOps(remoteToAppData(d2.medDocs, d2.logDocs), d2.plaintext));
-
-    const s3 = snapshot();
-    const d3 = await decodeRemote(dek, UID, s3.meds, s3.logs);
-    expect(d3.plaintext).toEqual({ medIds: [], logs: [] });
-    expect(d3.undecryptable).toBe(0);
-    expect(migrationOps(remoteToAppData(d3.medDocs, d3.logDocs), d3.plaintext)).toEqual([]);
-    // Everything stored is ciphertext now; invalid and orphaned plaintext was deleted.
-    for (const v of Object.values(meds)) expect(Object.keys(v as object).sort()).toEqual(['ct', 'iv', 'v']);
-    expect(Object.keys(months['2026-02']!).sort()).toEqual(['1']);
-    expect(months['2026-03']!['2']).toHaveProperty('ct');
-    // Same data as before the migration.
-    const after = remoteToAppData(d3.medDocs, d3.logDocs).data;
-    expect(after.medications).toEqual(before.medications);
-    expect([...after.doseLogs].sort((a, b) => a.id.localeCompare(b.id))).toEqual(
-      [...before.doseLogs].sort((a, b) => a.id.localeCompare(b.id)),
-    );
-  });
-});
-
-describe('keepLocalForFailed', () => {
-  it("keeps this device's copy of items whose cloud documents couldn't be decrypted", () => {
-    const remote = { version: 1 as const, medications: [med('a')], doseLogs: [log('1')] };
-    const local = {
-      version: 1 as const,
-      medications: [med('a'), med('b'), med('c')],
-      doseLogs: [log('1'), log('2', { medId: 'b' }), log('3', { medId: 'c' })],
+    /** One sync round: what sync.ts uploads and tidies after a settled server snapshot. */
+    let local: AppData = { version: 1, medications: [], doseLogs: [] };
+    const round = async () => {
+      const s = snapshot();
+      const decoded = await decodeRemote(dek, UID, s.meds, s.logs);
+      const remote = remoteToAppData(decoded);
+      const r = reconcile({ remote, local, queued: [], failed: decoded.failedIds, cutoff: 0 });
+      local = r.shown;
+      const refs = [...migrationRefs(remote, decoded.plaintext), ...r.uploads, ...r.removals];
+      await apply(resolveRefs(refs, local));
+      return { decoded, refs };
     };
-    const shown = keepLocalForFailed(remote, local, { meds: ['b'], logs: [] });
-    expect(shown.medications.map((m) => m.id).sort()).toEqual(['a', 'b']); // c was deleted elsewhere
-    expect(shown.doseLogs.map((l) => l.id).sort()).toEqual(['1', '2']);
-    expect(keepLocalForFailed(remote, local, { meds: [], logs: [] })).toBe(remote);
+
+    const first = await round();
+    const before = remoteToAppData(first.decoded).data;
+    for (let i = 0; i < 3; i++) await round();
+    const last = await round();
+    expect(last.refs).toEqual([]);
+    expect(last.decoded.plaintext).toEqual({ medIds: [], logs: [] });
+    expect(last.decoded.undecryptable).toBe(0);
+    // Everything stored is ciphertext (or a deletion marker); all logs are in shard documents.
+    expect(Object.keys(meds.a as object).sort()).toEqual(['ct', 'iv', 'v']);
+    expect(meds.bad).toEqual({ v: 1, deleted: true });
+    expect(Object.keys(docs['2026-02']!)).toEqual([]);
+    for (const [id, entries] of Object.entries(docs)) {
+      if (id === '2026-02') continue;
+      expect(id).toMatch(/^\d{4}-\d{2}~[0-9a-z]+$/);
+      for (const v of Object.values(entries)) expect(v).toHaveProperty('ct');
+    }
+    // Same data as before (the orphan went).
+    const after = remoteToAppData(last.decoded).data;
+    expect(after.medications.map((m) => m.id)).toEqual(['a']);
+    expect(after.doseLogs.map((l) => l.id).sort()).toEqual(before.doseLogs.map((l) => l.id).sort());
+    expect(after.doseLogs.map((l) => l.id).sort()).toEqual(['1', '2', 'enc']);
   });
 });

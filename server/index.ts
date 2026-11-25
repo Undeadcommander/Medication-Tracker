@@ -293,6 +293,7 @@ async function tick(): Promise<void> {
       for (const [id, t] of m) if (now - t > 3_600_000) m.delete(id);
       if (!m.size) recentlySent.delete(dev);
     }
+    for (const [dev, t] of lastTest) if (now - t > TEST_COOLDOWN_MS) lastTest.delete(dev);
 
     for (const [deviceId, rec] of [...devices]) {
       const due = rec.reminders.filter((r) => r.at <= now).sort((a, b) => a.at - b.at);

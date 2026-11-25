@@ -70,3 +70,17 @@ export async function forgetAllDeviceKeys(): Promise<void> {
     /* nothing stored */
   }
 }
+
+/** Forget the stored key only if it's the one with this keyId (one transaction, so a newer key saved meanwhile is kept). */
+export async function forgetDeviceKeyIf(uid: string, keyId: string): Promise<void> {
+  try {
+    await run('readwrite', (s) => {
+      const req = s.get(uid);
+      req.onsuccess = () => {
+        if ((req.result as Partial<StoredKey> | undefined)?.keyId === keyId) s.delete(uid);
+      };
+    });
+  } catch {
+    /* nothing stored */
+  }
+}

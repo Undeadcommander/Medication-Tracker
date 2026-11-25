@@ -1,5 +1,6 @@
 import { nextOccurrence, occurrencesBetween, occurrencesOn } from '../../shared/schedule';
 import type { DoseLog, DoseStatus, Medication } from '../../shared/types';
+import { logsByMed } from './supply';
 
 export interface Dose {
   med: Medication;
@@ -14,10 +15,24 @@ const MISSED_AFTER_MS = 4 * 3_600_000;
 /** It shows as "due" from this long before its time. */
 const DUE_WINDOW_MS = 30 * 60_000;
 
-export function logIndex(logs: DoseLog[]): Map<string, DoseLog> {
+// Indexes are per medication and built once per array of its logs. Arrays of medications whose
+// logs didn't change are reused (see logsByMed), so a tap re-indexes one medication, not all.
+const indexCache = new WeakMap<DoseLog[], Map<string, DoseLog>>();
+const NO_LOGS: DoseLog[] = [];
+
+/** One medication's logs by scheduled time. */
+function medIndex(medLogs: DoseLog[]): Map<string, DoseLog> {
+  const cached = indexCache.get(medLogs);
+  if (cached) return cached;
   const m = new Map<string, DoseLog>();
-  for (const l of logs) m.set(`${l.medId}|${l.scheduledFor}`, l);
+  for (const l of medLogs) m.set(l.scheduledFor, l);
+  indexCache.set(medLogs, m);
   return m;
+}
+
+/** `med`'s logs by scheduled time; `logs` may be everyone's or just this medication's. */
+function indexFor(med: Medication, logs: DoseLog[]): Map<string, DoseLog> {
+  return medIndex(logsByMed(logs).get(med.id) ?? NO_LOGS);
 }
 
 function classify(at: Date, log: DoseLog | undefined, now: Date): Dose['status'] {
@@ -28,23 +43,25 @@ function classify(at: Date, log: DoseLog | undefined, now: Date): Dose['status']
   return 'upcoming';
 }
 
+const byName = new Intl.Collator(undefined, { sensitivity: 'base' });
+
 export function dosesForDay(meds: Medication[], logs: DoseLog[], day: Date, now = new Date()): Dose[] {
-  const idx = logIndex(logs);
   const out: Dose[] = [];
   for (const med of meds) {
+    const idx = indexFor(med, logs);
     for (const at of occurrencesOn(med.schedule, day)) {
       const key = at.toISOString();
-      out.push({ med, at, key, status: classify(at, idx.get(`${med.id}|${key}`), now) });
+      out.push({ med, at, key, status: classify(at, idx.get(key), now) });
     }
   }
-  return out.sort((a, b) => a.at.getTime() - b.at.getTime() || a.med.name.localeCompare(b.med.name));
+  return out.sort((a, b) => a.at.getTime() - b.at.getTime() || byName.compare(a.med.name, b.med.name));
 }
 
 export function dosesInRange(med: Medication, logs: DoseLog[], from: Date, to: Date, now = new Date()): Dose[] {
-  const idx = logIndex(logs);
+  const idx = indexFor(med, logs);
   return occurrencesBetween(med.schedule, from, to).map((at) => {
     const key = at.toISOString();
-    return { med, at, key, status: classify(at, idx.get(`${med.id}|${key}`), now) };
+    return { med, at, key, status: classify(at, idx.get(key), now) };
   });
 }
 
@@ -54,13 +71,13 @@ export function nextDoseFor(med: Medication, logs: DoseLog[], now = new Date()):
   const pending = today.find((d) => d.status === 'due');
   if (pending) return pending;
   // Skip future doses that were already taken or skipped early.
-  const idx = logIndex(logs);
+  const idx = indexFor(med, logs);
   let after = now;
   for (let i = 0; i < 64; i++) {
     const next = nextOccurrence(med.schedule, after);
     if (!next) return null;
     const key = next.toISOString();
-    if (!idx.has(`${med.id}|${key}`)) return { med, at: next, key, status: classify(next, undefined, now) };
+    if (!idx.has(key)) return { med, at: next, key, status: classify(next, undefined, now) };
     after = next;
   }
   return null;
@@ -106,12 +123,12 @@ export function formatWhen(d: Date, now = new Date()): string {
   return `${formatDay(d)} at ${formatClock(d)}`;
 }
 
-/** Days of supply left at the current schedule rate, or null if unknown. */
-export function supplyDaysLeft(med: Medication, now = new Date()): number | null {
-  if (typeof med.supplyRemaining !== 'number') return null;
+/** Days that `onHand` units last at the current schedule rate, or null if unknown. */
+export function supplyDaysLeft(med: Medication, onHand: number | undefined, now = new Date()): number | null {
+  if (typeof onHand !== 'number') return null;
   const end = new Date(now);
   end.setDate(end.getDate() + 28);
   const per28 = occurrencesBetween(med.schedule, now, end).length * (med.quantityPerDose ?? 1);
   if (!per28) return null;
-  return Math.floor(med.supplyRemaining / (per28 / 28));
+  return Math.floor(onHand / (per28 / 28));
 }

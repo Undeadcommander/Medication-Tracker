@@ -10,6 +10,7 @@ interface Props {
   /** Cloud encryption settings (signed-in accounts only). */
   onEncryption?: () => void;
   onSignOut: () => void;
+  onDeleteAccount: () => void;
 }
 
 export function Avatar({ user, size = 36 }: { user: User; size?: number }) {
@@ -45,7 +46,7 @@ const SYNC_TEXT: Record<SyncStatus['state'], string> = {
   setup: 'Set up encrypted sync to back up your data',
 };
 
-export function AccountMenu({ user, syncStatus, onNotifications, onExportImport, onEncryption, onSignOut }: Props) {
+export function AccountMenu({ user, syncStatus, onNotifications, onExportImport, onEncryption, onSignOut, onDeleteAccount }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -120,6 +121,9 @@ export function AccountMenu({ user, syncStatus, onNotifications, onExportImport,
           </button>
           <button type="button" role="menuitem" className="account-item" onClick={choose(onSignOut)}>
             {user.provider === 'guest' ? '↪ Sign in with Google' : '↪ Sign out'}
+          </button>
+          <button type="button" role="menuitem" className="account-item account-item-danger" onClick={choose(onDeleteAccount)}>
+            {user.provider === 'guest' ? '🗑 Delete all data' : '🗑 Delete account'}
           </button>
         </div>
       )}

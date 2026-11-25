@@ -1,19 +1,39 @@
+import { memo, useMemo } from 'react';
 import { describeSchedule } from '../../shared/schedule';
 import type { DoseLog, Medication } from '../../shared/types';
 import { dosesForDay, formatWhen, nextDoseFor, supplyDaysLeft } from '../lib/doses';
+import { logsByMed, supplyOnHand } from '../lib/supply';
 
 interface Props {
   med: Medication;
-  logs: DoseLog[];
+  /** This medication's dose logs only. */
+  medLogs: DoseLog[];
+  /** Units on hand now (derived), undefined if supply isn't tracked. */
+  onHand: number | undefined;
   now: Date;
-  onOpen: () => void;
+  /** One stable callback for every tile; gets the medication id. */
+  onOpen: (id: string) => void;
 }
 
-export function MedTile({ med, logs, now, onOpen }: Props) {
-  const today = dosesForDay([med], logs, now, now);
+const NO_LOGS: DoseLog[] = [];
+const minuteOf = (d: Date) => Math.floor(d.getTime() / 60_000);
+
+function sameLogs(a: DoseLog[], b: DoseLog[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x !== y && (x.scheduledFor !== y.scheduledFor || x.status !== y.status)) return false;
+  }
+  return true;
+}
+
+function MedTileView({ med, medLogs, onHand, now, onOpen }: Props) {
+  const today = dosesForDay([med], medLogs, now, now);
   const takenToday = today.filter((d) => d.status === 'taken').length;
-  const next = nextDoseFor(med, logs, now);
-  const daysLeft = supplyDaysLeft(med, now);
+  const next = nextDoseFor(med, medLogs, now);
+  const daysLeft = supplyDaysLeft(med, onHand, now);
   const lowSupply = daysLeft !== null && daysLeft <= 7;
   const purpose = med.drugInfo?.purpose;
   const subtitle = [med.dosage, med.quantityPerDose && med.form ? `${med.quantityPerDose} × ${med.form}` : med.form]
@@ -21,7 +41,7 @@ export function MedTile({ med, logs, now, onOpen }: Props) {
     .join(' · ');
 
   return (
-    <button type="button" className="tile card" onClick={onOpen} style={{ '--accent': med.color } as React.CSSProperties}>
+    <button type="button" className="tile card" onClick={() => onOpen(med.id)} style={{ '--accent': med.color } as React.CSSProperties}>
       <span className="tile-accent" aria-hidden />
       <span className="tile-head">
         <span className="tile-title">
@@ -71,12 +91,46 @@ export function MedTile({ med, logs, now, onOpen }: Props) {
         ) : (
           <span className="muted">No doses today</span>
         )}
-        {typeof med.supplyRemaining === 'number' && (
+        {typeof onHand === 'number' && (
           <span className={`chip ${lowSupply ? 'chip-warn' : ''}`}>
-            {med.supplyRemaining} left{daysLeft !== null ? ` · ~${daysLeft}d` : ''}
+            {onHand} left{daysLeft !== null ? ` · ~${daysLeft}d` : ''}
           </span>
         )}
       </span>
     </button>
   );
 }
+
+/**
+ * Re-renders only when this medication, its own logs or its supply changed, or the clock minute
+ * moved (the labels are minute-granular), not on every 30s tick, dialog change or other medication's dose.
+ */
+export const MedTile = memo(
+  MedTileView,
+  (a, b) =>
+    a.med === b.med &&
+    a.onHand === b.onHand &&
+    a.onOpen === b.onOpen &&
+    minuteOf(a.now) === minuteOf(b.now) &&
+    sameLogs(a.medLogs, b.medLogs),
+);
+
+interface GridProps {
+  meds: Medication[];
+  logs: DoseLog[];
+  now: Date;
+  onOpen: (id: string) => void;
+}
+
+/** The medication tiles. Memoised as a whole so opening/closing dialogs doesn't touch 500 tiles. */
+export const MedGrid = memo(function MedGrid({ meds, logs, now, onOpen }: GridProps) {
+  const byMed = logsByMed(logs); // cached per log array
+  const onHand = useMemo(() => new Map(meds.map((m) => [m.id, supplyOnHand(m, logs)])), [meds, logs]);
+  return (
+    <div className="tiles">
+      {meds.map((m) => (
+        <MedTile key={m.id} med={m} medLogs={byMed.get(m.id) ?? NO_LOGS} onHand={onHand.get(m.id)} now={now} onOpen={onOpen} />
+      ))}
+    </div>
+  );
+});

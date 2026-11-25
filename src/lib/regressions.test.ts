@@ -1,10 +1,11 @@
 // Regression tests for issues found in QA.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { makeSchedule, occurrencesOn } from '../../shared/schedule';
 import type { AppData, DoseLog, Medication } from '../../shared/types';
 import { nextDoseFor } from './doses';
 import { mapRxTermsResponse } from './drugLookup';
-import { applyLogDose, applyUndoDose } from './store';
+import { applyLogDose, applySaveMedication, applyUndoDose } from './store';
+import { supplyOnHand } from './supply';
 import { encryptVault, mergeAppData, VaultError } from './vault';
 
 const med = (over: Partial<Medication> = {}): Medication => ({
@@ -62,7 +63,7 @@ describe('supply on hand', () => {
     doseLogs: [],
   });
   const at = '2026-01-02T14:00:00.000Z';
-  const supplyOf = (d: AppData) => d.medications[0].supplyRemaining;
+  const supplyOf = (d: AppData) => supplyOnHand(d.medications[0]!, d.doseLogs);
 
   it('undo after taking with zero supply does not inflate it', () => {
     const taken = applyLogDose(data(0), 'm1', at, 'taken');
@@ -85,6 +86,66 @@ describe('supply on hand', () => {
     d = applyLogDose(d, 'm1', at, 'taken');
     expect(supplyOf(d)).toBe(8);
     expect(d.doseLogs).toHaveLength(1);
+  });
+
+  it('logging a dose changes only the dose log (once the count is tracked from logs)', () => {
+    const first = applyLogDose(data(10), 'm1', at, 'taken'); // an older count gets a time once
+    const counted = first.medications[0]!;
+    expect(counted.supplyCountedAt).toBeTruthy();
+    const second = applyLogDose(first, 'm1', '2026-01-03T14:00:00.000Z', 'taken');
+    expect(second.medications[0]).toBe(counted);
+    expect(supplyOf(second)).toBe(8);
+  });
+
+  it('doses logged on two devices at once both count', () => {
+    const base = applyLogDose(data(30), 'm1', at, 'taken'); // 29
+    const phone = applyLogDose(base, 'm1', '2026-01-03T08:00:00.000Z', 'taken');
+    const laptop = applyLogDose(base, 'm1', '2026-01-03T20:00:00.000Z', 'taken');
+    // What both devices end up with after syncing: the medication unchanged, both logs.
+    const synced = mergeAppData(phone, laptop);
+    expect(synced.doseLogs).toHaveLength(3);
+    expect(supplyOf(synced)).toBe(27);
+  });
+
+  it('entering a new count in the form starts counting from it; keeping it shown leaves it alone', () => {
+    // Each step a few seconds after the last (they'd otherwise all happen in one millisecond).
+    let clock = Date.parse('2026-01-03T09:00:00.000Z');
+    vi.useFakeTimers();
+    const tick = () => vi.setSystemTime((clock += 5000));
+    tick();
+    let d = applyLogDose(data(10), 'm1', at, 'taken'); // 9 on hand
+    tick();
+    const m = d.medications[0]!;
+    const same = applySaveMedication(d, { ...m, supplyRemaining: 9, notes: 'x' }, 9);
+    expect(same.medications[0]!.supplyRemaining).toBe(m.supplyRemaining);
+    expect(supplyOf(same)).toBe(9);
+    d = applySaveMedication(d, { ...m, supplyRemaining: 60 }, 9); // refilled
+    expect(supplyOf(d)).toBe(60);
+    tick();
+    d = applyLogDose(d, 'm1', '2026-01-03T14:00:00.000Z', 'taken');
+    expect(supplyOf(d)).toBe(59);
+    // Toggling something else passes the stored count through unchanged.
+    const toggled = applySaveMedication(d, { ...d.medications[0]!, notificationsEnabled: false });
+    expect(supplyOf(toggled)).toBe(59);
+    vi.useRealTimers();
+  });
+
+  it('a refill to the same count as last time counts (the form shows what is on hand, not the old count)', () => {
+    let clock = Date.parse('2026-02-01T09:00:00.000Z');
+    vi.useFakeTimers();
+    const tick = () => vi.setSystemTime((clock += 5000));
+    tick();
+    let d = applySaveMedication(data(30), { ...data(30).medications[0]!, supplyRemaining: 30 }, 12); // counted 30
+    for (let i = 0; i < 5; i++) {
+      tick();
+      d = applyLogDose(d, 'm1', `2026-02-0${i + 2}T14:00:00.000Z`, 'taken');
+    }
+    expect(supplyOf(d)).toBe(25);
+    tick();
+    const shown = supplyOf(d)!; // what the form opens with
+    d = applySaveMedication(d, { ...d.medications[0]!, supplyRemaining: 30 }, shown); // refilled to 30
+    expect(supplyOf(d)).toBe(30);
+    vi.useRealTimers();
   });
 });
 

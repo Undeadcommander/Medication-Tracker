@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { describeSchedule, effectiveTimes, formatTime12, fromDateKey, WEEKDAY_SHORT } from '../../shared/schedule';
 import type { DoseLog, DoseStatus, Medication } from '../../shared/types';
 import { adherence, dosesInRange, formatClock, formatDay, formatWhen, nextDoseFor, supplyDaysLeft } from '../lib/doses';
+import { supplyOnHand } from '../lib/supply';
 import { Modal } from './Modal';
 
 interface Props {
@@ -29,20 +30,25 @@ function Section({ title, text, defaultOpen = false }: { title: string; text?: s
 export function MedDetail({ med, logs, now, onClose, onEdit, onDelete, onToggleNotifications, onLog, onUndo }: Props) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const info = med.drugInfo;
-  const next = nextDoseFor(med, logs, now);
-  const adh = adherence(med, logs, 30, now);
-  const daysLeft = supplyDaysLeft(med, now);
-
-  const histFrom = new Date(now);
-  histFrom.setDate(histFrom.getDate() - 14);
-  const history = dosesInRange(med, logs, histFrom, now, now)
-    .filter((d) => d.status !== 'upcoming')
-    .reverse();
-  const upcomingTo = new Date(now);
-  upcomingTo.setDate(upcomingTo.getDate() + 30);
-  const upcoming = dosesInRange(med, logs, now, upcomingTo, now)
-    .filter((d) => d.status === 'upcoming')
-    .slice(0, 6);
+  // These scan schedule occurrences and the log index; only redo them when their inputs change.
+  const onHand = useMemo(() => supplyOnHand(med, logs), [med, logs]);
+  const { next, adh, daysLeft, history, upcoming } = useMemo(() => {
+    const histFrom = new Date(now);
+    histFrom.setDate(histFrom.getDate() - 14);
+    const upcomingTo = new Date(now);
+    upcomingTo.setDate(upcomingTo.getDate() + 30);
+    return {
+      next: nextDoseFor(med, logs, now),
+      adh: adherence(med, logs, 30, now),
+      daysLeft: supplyDaysLeft(med, onHand, now),
+      history: dosesInRange(med, logs, histFrom, now, now)
+        .filter((d) => d.status !== 'upcoming')
+        .reverse(),
+      upcoming: dosesInRange(med, logs, now, upcomingTo, now)
+        .filter((d) => d.status === 'upcoming')
+        .slice(0, 6),
+    };
+  }, [med, logs, now, onHand]);
 
   const s = med.schedule;
   const facts: [string, string | undefined][] = [
@@ -56,8 +62,8 @@ export function MedDetail({ med, logs, now, onClose, onEdit, onDelete, onToggleN
     ['Refill date', med.refillDate ? formatDay(fromDateKey(med.refillDate)) : undefined],
     [
       'Supply',
-      typeof med.supplyRemaining === 'number'
-        ? `${med.supplyRemaining} remaining${daysLeft !== null ? ` (about ${daysLeft} days)` : ''}`
+      typeof onHand === 'number'
+        ? `${onHand} remaining${daysLeft !== null ? ` (about ${daysLeft} days)` : ''}`
         : undefined,
     ],
   ];
@@ -123,7 +129,7 @@ export function MedDetail({ med, logs, now, onClose, onEdit, onDelete, onToggleN
           </div>
           <div className="stat">
             <span className="stat-label">Supply</span>
-            <span className="stat-value">{typeof med.supplyRemaining === 'number' ? med.supplyRemaining : '—'}</span>
+            <span className="stat-value">{typeof onHand === 'number' ? onHand : '—'}</span>
             {daysLeft !== null && <span className="stat-sub muted">~{daysLeft} days</span>}
           </div>
         </div>
