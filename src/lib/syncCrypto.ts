@@ -38,7 +38,7 @@ const MESSAGES: Record<SyncCryptoErrorCode, string> = {
   'wrong-recovery-key': "That recovery key doesn't match this account.",
   'invalid-recovery-key': "That doesn't look like a recovery key. Check for typos: it has 7 groups of 4 letters and digits.",
   corrupt: "The account's encryption settings in the cloud are damaged and can't be read.",
-  unsupported: 'This account was set up by a newer version of MedTracker. Reload the app to update it.',
+  unsupported: 'This account was set up by a newer version of Amendra. Reload the app to update it.',
   'weak-passphrase': 'Choose a longer, harder-to-guess passphrase.',
   'already-set-up': 'Encryption was just set up for this account on another device. Unlock with that passphrase instead.',
   'changed-elsewhere': 'The encryption settings were changed on another device at the same time. Please try again.',

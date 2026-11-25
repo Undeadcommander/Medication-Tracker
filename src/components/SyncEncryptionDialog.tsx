@@ -119,7 +119,7 @@ function PassphraseFields({ p, label = 'Sync passphrase' }: { p: ReturnType<type
             {copied === 'ok' ? 'Copied' : 'Copy'}
           </button>
           <p className="field-hint ei-generated-note">
-            Save it in a password manager or write it down. You'll need it to unlock MedTracker on a new device.
+            Save it in a password manager or write it down. You'll need it to unlock Amendra on a new device.
             {copied === 'fail' && ' Copying was blocked, so select the text and copy it manually.'}
           </p>
         </div>
@@ -135,16 +135,16 @@ function printRecoveryKey(key: string) {
   document.body.appendChild(frame);
   const doc = frame.contentDocument!;
   doc.open();
-  doc.write('<!doctype html><title>MedTracker recovery key</title>');
+  doc.write('<!doctype html><title>Amendra recovery key</title>');
   doc.close();
   const h = doc.createElement('h1');
-  h.textContent = 'MedTracker recovery key';
+  h.textContent = 'Amendra recovery key';
   const k = doc.createElement('p');
   k.textContent = key;
   k.style.cssText = 'font:600 22px ui-monospace,Menlo,Consolas,monospace;letter-spacing:1px';
   const note = doc.createElement('p');
   note.textContent =
-    'This key unlocks your encrypted MedTracker cloud sync if you forget your sync passphrase. Keep it somewhere safe and private.';
+    'This key unlocks your encrypted Amendra cloud sync if you forget your sync passphrase. Keep it somewhere safe and private.';
   doc.body.append(h, k, note);
   frame.contentWindow?.focus();
   frame.contentWindow?.print();
@@ -152,11 +152,11 @@ function printRecoveryKey(key: string) {
 }
 
 function downloadRecoveryKey(key: string) {
-  const text = `MedTracker recovery key\n\n${key}\n\nThis key unlocks your encrypted MedTracker cloud sync if you forget your sync passphrase.\nKeep it somewhere safe and private.\n`;
+  const text = `Amendra recovery key\n\n${key}\n\nThis key unlocks your encrypted Amendra cloud sync if you forget your sync passphrase.\nKeep it somewhere safe and private.\n`;
   const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'medtracker-recovery-key.txt';
+  a.download = 'amendra-recovery-key.txt';
   a.style.display = 'none';
   document.body.appendChild(a);
   a.click();
@@ -515,7 +515,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     body = (
       <div className="ei-panel">
         <p className="ei-lead">
-          MedTracker encrypts your medications and dose history on this device before syncing them, so only you can read
+          Amendra encrypts your medications and dose history on this device before syncing them, so only you can read
           them. Not Google, and not the app's developer. Choose a sync passphrase: you'll enter it once on each new
           device.
         </p>

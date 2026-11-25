@@ -235,7 +235,7 @@ function Tracker({
       <header className="topbar">
         <div className="brand">
           <img src={`${import.meta.env.BASE_URL}icons/icon.svg`} alt="" width={32} height={32} />
-          <span>MedTracker</span>
+          <span>Amendra</span>
         </div>
         <div className="topbar-actions">
           <button type="button" className="btn btn-primary" aria-label="Add medication" onClick={() => setDialog({ kind: 'add' })}>
@@ -306,7 +306,7 @@ function Tracker({
             </div>
             <h2>Add your first medication</h2>
             <p className="muted">
-              Start typing a name and MedTracker will recognize it, fill in its strengths and pull up what it's for.
+              Start typing a name and Amendra will recognize it, fill in its strengths and pull up what it's for.
             </p>
             <button type="button" className="btn btn-primary" onClick={() => setDialog({ kind: 'add' })}>
               Add medication

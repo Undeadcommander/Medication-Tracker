@@ -77,7 +77,7 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
     <main className="signin">
       <div className="signin-card card">
         <img src={`${import.meta.env.BASE_URL}icons/icon.svg`} alt="" width={64} height={64} className="signin-logo" />
-        <h1>MedTracker</h1>
+        <h1>Amendra</h1>
         <p className="muted">Keep track of your medications, schedules and reminders, all in one place.</p>
 
         {notice && (

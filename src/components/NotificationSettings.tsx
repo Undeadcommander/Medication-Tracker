@@ -21,11 +21,11 @@ interface Props {
 
 const STATE_TEXT: Record<PushState, string> = {
   unsupported: "This browser doesn't support notifications.",
-  'ios-needs-install': 'On iPhone and iPad, add MedTracker to your Home Screen to get notifications.',
+  'ios-needs-install': 'On iPhone and iPad, add Amendra to your Home Screen to get notifications.',
   denied: 'Notifications are blocked for this site. Allow them in your browser or system settings, then reload.',
   default: 'Notifications are off on this device.',
-  granted: "Notifications are allowed, but the reminder server isn't reachable. Reminders only arrive while MedTracker is open.",
-  subscribed: 'Push notifications are on. Reminders arrive even when MedTracker is closed.',
+  granted: "Notifications are allowed, but the reminder server isn't reachable. Reminders only arrive while Amendra is open.",
+  subscribed: 'Push notifications are on. Reminders arrive even when Amendra is closed.',
 };
 
 export function NotificationSettings({ discreet, onDiscreetChange, enabledMedCount, lastSync, onStateChange, onClose }: Props) {
@@ -82,7 +82,7 @@ export function NotificationSettings({ discreet, onDiscreetChange, enabledMedCou
             {!state
               ? 'Checking…'
               : state === 'granted' && !PUSH_SERVER_CONFIGURED
-                ? 'Notifications are on. Reminders appear while MedTracker is open or running in the background (this site has no reminder server for when it is closed).'
+                ? 'Notifications are on. Reminders appear while Amendra is open or running in the background (this site has no reminder server for when it is closed).'
                 : STATE_TEXT[state]}
           </span>
         </div>
@@ -98,7 +98,7 @@ export function NotificationSettings({ discreet, onDiscreetChange, enabledMedCou
             <li>
               Choose <strong>Add to Home Screen</strong>, then tap <strong>Add</strong>.
             </li>
-            <li>Open MedTracker from your Home Screen and come back here to turn on notifications.</li>
+            <li>Open Amendra from your Home Screen and come back here to turn on notifications.</li>
             <li className="muted">This needs iOS / iPadOS 16.4 or later.</li>
           </ol>
         )}
