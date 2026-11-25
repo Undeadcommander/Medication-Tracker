@@ -7,6 +7,8 @@ interface Props {
   syncStatus?: SyncStatus | null;
   onNotifications: () => void;
   onExportImport: () => void;
+  /** Cloud encryption settings (signed-in accounts only). */
+  onEncryption?: () => void;
   onSignOut: () => void;
 }
 
@@ -39,9 +41,11 @@ const SYNC_TEXT: Record<SyncStatus['state'], string> = {
   saving: 'Saving to the cloud…',
   offline: 'Offline. Changes will sync when you reconnect.',
   error: 'Cloud sync problem',
+  locked: 'Locked. Unlock this device to sync.',
+  setup: 'Set up encrypted sync to back up your data',
 };
 
-export function AccountMenu({ user, syncStatus, onNotifications, onExportImport, onSignOut }: Props) {
+export function AccountMenu({ user, syncStatus, onNotifications, onExportImport, onEncryption, onSignOut }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -88,6 +92,7 @@ export function AccountMenu({ user, syncStatus, onNotifications, onExportImport,
               {syncStatus ? (
                 <div className={`account-sync sync-${syncStatus.state}`} role="status" title={syncStatus.message}>
                   <span className="account-sync-dot" aria-hidden />
+                  {syncStatus.lock === 'unlocked' && <span aria-label="End-to-end encrypted">🔒 </span>}
                   {syncStatus.state === 'error' && syncStatus.message ? syncStatus.message : SYNC_TEXT[syncStatus.state]}
                 </div>
               ) : (
@@ -100,6 +105,16 @@ export function AccountMenu({ user, syncStatus, onNotifications, onExportImport,
           <button type="button" role="menuitem" className="account-item" onClick={choose(onNotifications)}>
             🔔 Notification settings
           </button>
+          {syncStatus?.warning && (
+            <div className="account-sync-warning" role="status">
+              ⚠ {syncStatus.warning}
+            </div>
+          )}
+          {onEncryption && (
+            <button type="button" role="menuitem" className="account-item" onClick={choose(onEncryption)}>
+              {syncStatus?.lock === 'locked' ? '🔑 Unlock cloud sync' : syncStatus?.lock === 'needs-setup' ? '🔑 Set up encrypted sync' : '🔑 Cloud encryption'}
+            </button>
+          )}
           <button type="button" role="menuitem" className="account-item" onClick={choose(onExportImport)}>
             🔐 Export / import data
           </button>

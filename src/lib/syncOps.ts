@@ -12,7 +12,7 @@ export type SyncOp =
   | { kind: 'setMed'; med: Medication }
   | { kind: 'deleteMed'; id: string }
   | { kind: 'setLog'; log: DoseLog }
-  | { kind: 'deleteLog'; log: Pick<DoseLog, 'id' | 'scheduledFor'> };
+  | { kind: 'deleteLog'; log: Pick<DoseLog, 'id' | 'scheduledFor'>; /** Month document, if not the one scheduledFor maps to. */ month?: string };
 
 /** Dose logs are grouped into one cloud document per month of the scheduled time (UTC). */
 export function logMonth(scheduledFor: string): string {
@@ -131,4 +131,54 @@ export function orphanLogs(logDocs: unknown[], medIds: Set<string>): Pick<DoseLo
     }
   }
   return out;
+}
+
+/**
+ * Cloud data to show, keeping this device's copy of anything whose cloud document couldn't be
+ * decrypted, so a damaged or tampered document never silently deletes local data.
+ */
+export function keepLocalForFailed(remote: AppData, local: AppData, failed: { meds: string[]; logs: string[] }): AppData {
+  if (!failed.meds.length && !failed.logs.length) return remote;
+  const medIds = new Set(remote.medications.map((m) => m.id));
+  const logIds = new Set(remote.doseLogs.map((l) => l.id));
+  const failedMeds = new Set(failed.meds);
+  const failedLogs = new Set(failed.logs);
+  const medications = [...remote.medications, ...local.medications.filter((m) => failedMeds.has(m.id) && !medIds.has(m.id))];
+  const keptMedIds = new Set(medications.map((m) => m.id));
+  const doseLogs = [
+    ...remote.doseLogs,
+    ...local.doseLogs.filter((l) => (failedLogs.has(l.id) || failedMeds.has(l.medId)) && !logIds.has(l.id) && keptMedIds.has(l.medId)),
+  ];
+  return { ...remote, medications, doseLogs };
+}
+
+/**
+ * Encryption migration: items still stored in plaintext (written before end-to-end encryption,
+ * or by an outdated app) are re-uploaded through the normal ops, which encrypt them and overwrite
+ * the plaintext in place. Plaintext that's invalid, a duplicate, an orphan, or filed under the
+ * wrong month is deleted instead. Pure, so it can run again after an interruption: whatever is
+ * still plaintext on the next snapshot is simply picked up again.
+ */
+export function migrationOps(
+  remote: RemoteState,
+  plaintext: { medIds: string[]; logs: { month: string; id: string }[] },
+): SyncOp[] {
+  const ops: SyncOp[] = [];
+  const meds = new Map(remote.data.medications.map((m) => [m.id, m]));
+  for (const id of plaintext.medIds) {
+    const med = meds.get(id);
+    ops.push(med ? { kind: 'setMed', med } : { kind: 'deleteMed', id });
+  }
+  const logs = new Map(remote.data.doseLogs.map((l) => [l.id, l]));
+  for (const ref of plaintext.logs) {
+    const log = logs.get(ref.id);
+    if (log && logMonth(log.scheduledFor) === ref.month) {
+      ops.push({ kind: 'setLog', log });
+    } else {
+      // Kept copies (if any) are written to their correct month by the normal ops.
+      ops.push({ kind: 'deleteLog', log: { id: ref.id, scheduledFor: log?.scheduledFor ?? '' }, month: ref.month });
+      if (log) ops.push({ kind: 'setLog', log });
+    }
+  }
+  return ops;
 }

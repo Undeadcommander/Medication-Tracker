@@ -7,6 +7,7 @@ import { MedForm } from './components/MedForm';
 import { MedTile } from './components/MedTile';
 import { NotificationSettings } from './components/NotificationSettings';
 import { SignInScreen } from './components/SignInScreen';
+import { SyncEncryptionDialog } from './components/SyncEncryptionDialog';
 import { TodayPanel } from './components/TodayPanel';
 import { clearSession, completeRedirectSignIn, loadSession, saveSession, signOut, watchAuth, type User } from './lib/auth';
 import { getPushState, onServiceWorkerMessage, registerServiceWorker, syncReminders } from './lib/push';
@@ -20,6 +21,7 @@ type Dialog =
   | { kind: 'detail'; id: string }
   | { kind: 'notifications' }
   | { kind: 'vault' }
+  | { kind: 'encryption' }
   | null;
 
 /** Re-render every 30s so "due"/"next dose" labels stay current. */
@@ -88,7 +90,7 @@ export default function App() {
 function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   // Google accounts sync through Firestore; the Firebase uid follows the "firebase:" prefix.
   const syncUid = user.provider === 'google' && user.id.startsWith('firebase:') ? user.id.slice('firebase:'.length) : undefined;
-  const { data, saveError, syncStatus, saveMedication, deleteMedication, logDose, undoDose, replaceData } = useAppData(
+  const { data, saveError, syncStatus, syncControls, saveMedication, deleteMedication, logDose, undoDose, replaceData } = useAppData(
     user.id,
     syncUid,
   );
@@ -98,6 +100,8 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   const [needsNotifSetup, setNeedsNotifSetup] = useState(false);
   const [syncTick, setSyncTick] = useState(0);
   const now = useNow();
+  const lock = syncStatus?.lock;
+  const encryptionPrompted = useRef(false);
   const logDoseRef = useRef(logDose);
   logDoseRef.current = logDose;
 
@@ -132,6 +136,14 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
     }, 800);
     return () => clearTimeout(t);
   }, [data.medications, data.doseLogs, prefs.discreetNotifications, syncTick]);
+
+  // Encrypted sync needs setting up or unlocking on this device: ask once per session.
+  useEffect(() => {
+    if ((lock === 'needs-setup' || lock === 'locked') && !encryptionPrompted.current) {
+      encryptionPrompted.current = true;
+      setDialog((d) => d ?? { kind: 'encryption' });
+    }
+  }, [lock]);
 
   // Nudge to set up notifications when meds want reminders but the device isn't set up.
   useEffect(() => {
@@ -178,6 +190,7 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
             user={user}
             onNotifications={() => setDialog({ kind: 'notifications' })}
             onExportImport={() => setDialog({ kind: 'vault' })}
+            onEncryption={syncUid ? () => setDialog({ kind: 'encryption' }) : undefined}
             onSignOut={onSignOut}
           />
         </div>
@@ -194,6 +207,19 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
         {saveError && (
           <div className="alert alert-error" role="alert">
             Couldn't save to this device's storage. Free up space or leave private browsing, and export a backup.
+          </div>
+        )}
+
+        {(lock === 'needs-setup' || lock === 'locked') && dialog?.kind !== 'encryption' && (
+          <div className="banner card">
+            <span>
+              {lock === 'needs-setup'
+                ? '🔒 Turn on end-to-end encrypted sync to back up your data and use it on your other devices.'
+                : '🔒 Cloud sync is locked on this device. Changes are saved here and upload once you unlock.'}
+            </span>
+            <button type="button" className="btn btn-sm btn-primary" onClick={() => setDialog({ kind: 'encryption' })}>
+              {lock === 'needs-setup' ? 'Set up' : 'Unlock'}
+            </button>
           </div>
         )}
 
@@ -283,6 +309,9 @@ function Tracker({ user, onSignOut }: { user: User; onSignOut: () => void }) {
           onStateChange={() => setSyncTick((n) => n + 1)}
           onClose={() => setDialog(null)}
         />
+      )}
+      {dialog?.kind === 'encryption' && (
+        <SyncEncryptionDialog status={syncStatus} controls={syncControls} onClose={() => setDialog(null)} />
       )}
       {dialog?.kind === 'vault' && <ExportImportDialog data={data} onImport={onImport} onClose={() => setDialog(null)} />}
     </div>

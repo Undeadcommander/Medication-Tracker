@@ -121,6 +121,7 @@ export function useAppData(userId: string, syncUid?: string) {
   // The latest state, updated synchronously so each edit is diffed against what preceded it.
   const dataRef = useRef(data);
   const syncRef = useRef<SyncHandle | null>(null);
+  const [syncControls, setSyncControls] = useState<SyncHandle | null>(null);
 
   /** Data that didn't come from a local edit (cloud, another tab, account switch). */
   const applyExternal = useCallback((next: AppData) => {
@@ -164,6 +165,7 @@ export function useAppData(userId: string, syncUid?: string) {
   useEffect(() => {
     if (!syncUid) {
       setSyncStatus(null);
+      setSyncControls(null);
       return;
     }
     const handle = startSync({
@@ -173,9 +175,11 @@ export function useAppData(userId: string, syncUid?: string) {
       onStatus: setSyncStatus,
     });
     syncRef.current = handle;
+    setSyncControls(handle);
     return () => {
       handle.stop();
       if (syncRef.current === handle) syncRef.current = null;
+      setSyncControls((h) => (h === handle ? null : h));
     };
   }, [syncUid, applyExternal]);
 
@@ -216,7 +220,7 @@ export function useAppData(userId: string, syncUid?: string) {
   /** Imports count as local edits, so they sync too. */
   const replaceData = useCallback((next: AppData) => commit(() => next), [commit]);
 
-  return { data, saveError, syncStatus, saveMedication, deleteMedication, logDose, undoDose, replaceData };
+  return { data, saveError, syncStatus, syncControls, saveMedication, deleteMedication, logDose, undoDose, replaceData };
 }
 
 /** Per-device preferences that aren't part of the exported data. */

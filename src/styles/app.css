@@ -926,3 +926,65 @@
 .sync-error .account-sync-dot {
   background: var(--danger);
 }
+.sync-locked .account-sync-dot,
+.sync-setup .account-sync-dot {
+  background: var(--warning);
+}
+.account-sync-warning {
+  margin: 0 12px 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+/* ---------- Cloud encryption dialog ---------- */
+.enc-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.enc-section h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.enc-section .field-hint {
+  margin: 0;
+}
+.enc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.enc-recovery {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.enc-recovery-key {
+  font: 600 1.05rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.04em;
+  word-break: break-word;
+  user-select: all;
+  -webkit-user-select: all;
+}
+.enc-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+.enc-check input {
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  flex: none;
+}

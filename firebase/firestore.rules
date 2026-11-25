@@ -1,15 +1,33 @@
 rules_version = '2';
 
-// MedTracker cloud sync. Each signed-in Google account can read and write only its own data:
-//   users/{uid}/meds/{medId}       one document per medication
-//   users/{uid}/logs/{YYYY-MM}     dose history, one document per month
+// MedTracker cloud sync (end-to-end encrypted). Each signed-in Google account can read and write
+// only its own data:
+//   users/{uid}/meds/{medId}       one document per medication: { v, iv, ct } (ciphertext only)
+//   users/{uid}/logs/{YYYY-MM}     dose history, one document per month: { logs: { [logId]: { v, iv, ct } } }
+//   users/{uid}/meta/crypto        the wrapped data key (no secrets in readable form)
 // Everything else is denied.
 service cloud.firestore {
   match /databases/{database}/documents {
     match /users/{uid}/{collection}/{docId} {
-      allow read, write: if request.auth != null
-        && request.auth.uid == uid
-        && collection in ['meds', 'logs'];
+      function isOwner() {
+        return request.auth != null && request.auth.uid == uid;
+      }
+
+      allow read, delete: if isOwner() && collection in ['meds', 'logs', 'meta'];
+
+      // Medications must be ciphertext, so an outdated app can't upload them in plaintext.
+      allow create, update: if isOwner() && collection == 'meds'
+        && request.resource.data.keys().hasOnly(['v', 'iv', 'ct'])
+        && request.resource.data.v == 1
+        && request.resource.data.iv is string
+        && request.resource.data.ct is string;
+
+      allow create, update: if isOwner() && collection == 'logs'
+        && request.resource.data.keys().hasOnly(['logs'])
+        && request.resource.data.logs is map;
+
+      allow create, update: if isOwner() && collection == 'meta' && docId == 'crypto'
+        && request.resource.data.v == 1;
     }
   }
 }
