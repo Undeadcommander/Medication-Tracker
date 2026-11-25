@@ -1,0 +1,205 @@
+/* Export / import dialog. Uses design tokens only. */
+.ei-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 16px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+}
+.ei-tab {
+  flex: 1;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: calc(var(--radius-sm) - 2px);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ei-tab:hover {
+  color: var(--text);
+}
+.ei-tab[aria-selected='true'] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.ei-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ei-lead,
+.ei-summary {
+  margin: 0;
+}
+.ei-summary {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--primary-soft);
+  color: var(--text);
+  font-size: 0.92rem;
+}
+.ei-lead code {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-size: 0.9em;
+}
+
+.ei-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ei-input-row {
+  display: flex;
+  gap: 8px;
+}
+.ei-input-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.ei-input-row .btn {
+  flex-shrink: 0;
+  min-width: 64px;
+}
+.ei-file {
+  padding: 8px;
+}
+.ei-file::file-selector-button {
+  margin-right: 10px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Strength meter */
+.ei-meter-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.ei-meter {
+  display: flex;
+  flex: 1;
+  gap: 4px;
+}
+.ei-meter span {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+}
+.ei-meter[data-score='0'] span.on {
+  background: var(--danger);
+}
+.ei-meter[data-score='1'] span.on {
+  background: var(--warning);
+}
+.ei-meter[data-score='2'] span.on {
+  background: var(--warning);
+}
+.ei-meter[data-score='3'] span.on,
+.ei-meter[data-score='4'] span.on {
+  background: var(--success);
+}
+.ei-meter-label {
+  min-width: 128px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+/* Generated passphrase */
+.ei-generated {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border: 1px dashed var(--primary);
+  border-radius: var(--radius-sm);
+  background: var(--primary-soft);
+}
+.ei-generated-text {
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  user-select: all;
+}
+.ei-generated-note {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/* Import */
+.ei-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ei-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.ei-modes legend {
+  padding: 0;
+  margin-bottom: 6px;
+}
+.ei-mode {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  cursor: pointer;
+}
+.ei-mode:has(input:checked) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+.ei-mode:has(input:focus-visible) {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.ei-mode input {
+  margin-top: 4px;
+  accent-color: var(--primary);
+}
+.ei-mode > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+@media (max-width: 560px) {
+  .ei-meter-wrap {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  .ei-meter-label {
+    text-align: left;
+  }
+}
