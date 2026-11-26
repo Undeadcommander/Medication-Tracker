@@ -24,7 +24,8 @@
   border-radius: 16px;
 }
 .google-btn {
-  min-width: 260px;
+  min-width: min(260px, 100%);
+  max-width: 100%;
   min-height: 46px;
   gap: 10px;
   border-radius: 999px;
@@ -243,6 +244,29 @@
 }
 .empty-icon {
   font-size: 2.6rem;
+}
+
+/* ---------- Locked (encrypted sync not unlocked on this device) ---------- */
+.lock-panel {
+  padding: 20px;
+  display: grid;
+  gap: 14px;
+  max-width: 560px;
+  margin: 0 auto;
+}
+.lock-panel h2 {
+  margin: 0;
+}
+.lock-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.lock-footer {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
 }
 
 /* ---------- Today ---------- */
@@ -1039,4 +1063,16 @@
 .btn-link:disabled {
   cursor: default;
   opacity: 0.6;
+}
+
+/* An alert the user can dismiss (e.g. why the device couldn't be locked). */
+.alert-dismissible {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.alert-dismissible .btn {
+  flex-shrink: 0;
+  color: inherit;
 }

@@ -1,4 +1,4 @@
-import { useId, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { deleteAccount, type DeleteStep } from '../lib/account';
 import type { User } from '../lib/auth';
 import { describeKeyError, type SyncHandle } from '../lib/sync';
@@ -12,8 +12,11 @@ interface Props {
   doseLogCount: number;
   /** Open the export dialog instead, to keep a backup. */
   onExport: () => void;
-  /** Everything was deleted. */
-  onDeleted: () => void;
+  /**
+   * The account's data was deleted, and this tab's session has ended. `problem`: what didn't work
+   * after that (worded for the user), to show instead of the usual message.
+   */
+  onDeleted: (problem?: string) => void;
   onClose: () => void;
 }
 
@@ -42,6 +45,17 @@ export function DeleteAccountDialog({ user, sync, medicationCount, doseLogCount,
   const [error, setError] = useState<string | null>(null);
   const busy = step !== null;
   const confirmed = typed.trim().toUpperCase() === CONFIRM_WORD;
+  // Closed (e.g. the account was deleted in another tab and this tab signed out) before a deletion
+  // started here finished (a Google pop-up still open): its result is for a session that's over.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const onDeletedRef = useRef(onDeleted);
+  onDeletedRef.current = onDeleted;
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -49,12 +63,15 @@ export function DeleteAccountDialog({ user, sync, medicationCount, doseLogCount,
     setError(null);
     setStep(google ? 'confirming' : 'device');
     // No await before deleteAccount: Google's confirmation pop-up has to open within this tap.
-    deleteAccount(user, sync, setStep)
-      .then((done) => {
+    deleteAccount(user, sync, (s) => mounted.current && setStep(s))
+      .then((result) => {
+        if (!mounted.current) return;
         setStep(null);
-        if (done) onDeleted();
+        // (Deleted, even if something after that failed: the session has ended, so this tab signs out.)
+        if (result.deleted) onDeletedRef.current(result.problem);
       })
       .catch((err) => {
+        if (!mounted.current) return;
         setStep(null);
         setError(describe(err));
       });

@@ -73,8 +73,9 @@ const NO_LOGS: DoseLog[] = [];
 /** Units on hand now, or undefined if supply isn't tracked for this medication. */
 export function supplyOnHand(med: Medication, logs: DoseLog[]): number | undefined {
   if (typeof med.supplyRemaining !== 'number') return undefined;
-  // Counted by an older version, which deducted doses from the count itself.
-  if (!med.supplyCountedAt) return med.supplyRemaining;
+  // Counted by an older version, which deducted doses from the count itself (and could take it
+  // below zero).
+  if (!med.supplyCountedAt) return med.supplyRemaining > 0 ? med.supplyRemaining : 0;
   const own = logsByMed(logs).get(med.id) ?? NO_LOGS;
   const memo = onHandMemo.get(med);
   if (memo && memo.logs === own) return memo.value;

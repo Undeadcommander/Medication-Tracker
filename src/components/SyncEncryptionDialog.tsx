@@ -1,14 +1,24 @@
-import { useId, useMemo, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { describeKeyError, type PreparedKeyChange, type SyncHandle, type SyncStatus } from '../lib/sync';
 import { looksLikeRecoveryKey, MIN_SYNC_PASSPHRASE_LENGTH, SyncCryptoError } from '../lib/syncCrypto';
-import { estimatePassphraseStrength, generatePassphrase } from '../lib/vault';
+import { generatePassphrase } from '../lib/vault';
 import { Modal } from './Modal';
+import { usePassphraseStrength } from './usePassphraseStrength';
 import './ExportImportDialog.css';
 
 interface Props {
   status: SyncStatus | null;
   controls: SyncHandle | null;
   onClose: () => void;
+  /**
+   * Shown in the page instead of as a dialog, and can't be dismissed: the account is locked, so
+   * this is all there is until it's unlocked (or set up again).
+   */
+  inline?: boolean;
+  /** Inline: unlocked (or set up). `next` is what to show next, as a dialog (see initialView). */
+  onUnlocked?: (next: 'recovered' | 'setup-done' | null) => void;
+  /** Open on this (after unlocking inline). */
+  initialView?: 'recovered' | 'setup-done';
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -19,26 +29,28 @@ function usePassphrasePair() {
   const [pass, setPass] = useState('');
   const [confirm, setConfirm] = useState('');
   const [show, setShow] = useState(false);
-  const strength = useMemo(() => estimatePassphraseStrength(pass), [pass]);
+  const [generated, setGenerated] = useState(false);
+  const { strength, checking, failed, retry } = usePassphraseStrength(pass);
   const tooShort = pass.length < MIN_SYNC_PASSPHRASE_LENGTH;
   const mismatch = confirm.length > 0 && pass !== confirm;
   let problem: string | null = null;
   if (pass && tooShort) problem = `Use at least ${MIN_SYNC_PASSPHRASE_LENGTH} characters (${MIN_SYNC_PASSPHRASE_LENGTH - pass.length} more).`;
-  else if (pass && strength.score < 1) problem = 'That passphrase is too easy to guess. Try a longer one or use the generator.';
+  else if (strength && strength.score < 1) problem = 'That passphrase is too easy to guess. Try a longer one or use the generator.';
   else if (mismatch) problem = 'The two passphrases do not match.';
-  const valid = !tooShort && strength.score >= 1 && pass === confirm;
+  // Never valid before the checker has rated it (still loading, or couldn't load).
+  const valid = !tooShort && strength !== null && strength.score >= 1 && pass === confirm;
   const clear = () => {
     setPass('');
     setConfirm('');
+    setGenerated(false);
   };
-  return { pass, setPass, confirm, setConfirm, show, setShow, strength, problem, valid, mismatch, clear };
+  return { pass, setPass, confirm, setConfirm, show, setShow, generated, setGenerated, strength, checking, failed, retry, problem, valid, mismatch, clear };
 }
 
 function PassphraseFields({ p, label = 'Sync passphrase' }: { p: ReturnType<typeof usePassphrasePair>; label?: string }) {
   const id = useId();
-  const [generated, setGenerated] = useState(false);
   const [copied, setCopied] = useState<'ok' | 'fail' | null>(null);
-  const filled = p.pass ? Math.max(1, p.strength.score) : 0;
+  const filled = p.strength ? Math.max(1, p.strength.score) : 0;
   return (
     <>
       <div className="field">
@@ -51,7 +63,7 @@ function PassphraseFields({ p, label = 'Sync passphrase' }: { p: ReturnType<type
             value={p.pass}
             onChange={(e) => {
               p.setPass(e.target.value);
-              setGenerated(false);
+              p.setGenerated(false);
             }}
             autoComplete="new-password"
             autoCapitalize="none"
@@ -80,13 +92,23 @@ function PassphraseFields({ p, label = 'Sync passphrase' }: { p: ReturnType<type
         />
       </div>
       <div className="ei-meter-wrap" aria-live="polite">
-        <div className="ei-meter" data-score={p.pass ? p.strength.score : -1} aria-hidden="true">
+        <div className="ei-meter" data-score={p.strength ? p.strength.score : -1} aria-hidden="true">
           {[0, 1, 2, 3].map((i) => (
             <span key={i} className={i < filled ? 'on' : ''} />
           ))}
         </div>
-        <span className="ei-meter-label">{p.pass ? `Strength: ${p.strength.label}` : 'Strength: not set'}</span>
+        <span className="ei-meter-label">
+          {p.checking ? 'Checking strength…' : p.strength ? `Strength: ${p.strength.label}` : 'Strength: not set'}
+        </span>
       </div>
+      {p.failed && (
+        <div className="alert alert-error" role="alert">
+          Couldn't load the passphrase strength check (are you offline?). A passphrase can't be accepted without it.{' '}
+          <button type="button" className="btn btn-sm" onClick={p.retry}>
+            Retry
+          </button>
+        </div>
+      )}
       {p.problem && (
         <div className="alert alert-warning" role="status">
           {p.problem}
@@ -101,14 +123,14 @@ function PassphraseFields({ p, label = 'Sync passphrase' }: { p: ReturnType<type
             p.setPass(g);
             p.setConfirm(g);
             p.setShow(true);
-            setGenerated(true);
+            p.setGenerated(true);
             setCopied(null);
           }}
         >
           Generate a strong passphrase
         </button>
       </div>
-      {generated && (
+      {p.generated && p.pass && (
         <div className="ei-generated" role="group" aria-label="Generated passphrase">
           <code className="ei-generated-text">{p.pass}</code>
           <button
@@ -211,9 +233,9 @@ type View =
   | { kind: 'reset' }
   | { kind: 'reset-key'; prepared: PreparedKeyChange };
 
-export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
+export function SyncEncryptionDialog({ status, controls, onClose, inline = false, onUnlocked, initialView }: Props) {
   const id = useId();
-  const [view, setView] = useState<View>({ kind: 'main' });
+  const [view, setView] = useState<View>({ kind: initialView ?? 'main' });
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -226,24 +248,40 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
   const newPass = usePassphrasePair();
 
   const lock = status?.lock ?? 'checking';
+  const opRef = useRef(0);
+  useEffect(
+    () => () => {
+      opRef.current += 1;
+    },
+    [],
+  );
   const go = (v: View) => {
+    opRef.current += 1;
     setView(v);
     setError(null);
     setSaved(false);
   };
+  const close = () => {
+    if (busy) return;
+    opRef.current += 1;
+    onClose();
+  };
 
   async function run<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
     if (!controls || busy) return undefined;
+    const token = ++opRef.current;
     setBusy(label);
     setError(null);
     setNotice(null);
     try {
-      return await fn();
+      const result = await fn();
+      if (opRef.current !== token) return undefined;
+      return result;
     } catch (e) {
-      setError(describeKeyError(e));
+      if (opRef.current === token) setError(describeKeyError(e));
       return undefined;
     } finally {
-      setBusy(null);
+      if (opRef.current === token) setBusy(null);
     }
   }
 
@@ -267,13 +305,14 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     if (ok) {
       go(next);
       if (message) setNotice(message);
+      if (next.kind === 'setup-done') onUnlocked?.('setup-done');
     }
   };
 
   const onUnlock = async (e: FormEvent) => {
     e.preventDefault();
     if (!secret) return;
-    const kind = await run('Unlocking…', async (): Promise<'recovery' | 'passphrase'> => {
+    const unlock = async (): Promise<'recovery' | 'passphrase'> => {
       if (useRecovery) {
         await controls!.unlock(secret, 'recovery');
         return 'recovery';
@@ -289,11 +328,18 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
       }
       await controls!.unlock(secret, 'passphrase');
       return 'passphrase';
+    };
+    const kind = await run('Unlocking…', async () => {
+      const k = await unlock();
+      // Unlocked: the app is told even if this dialog has gone meanwhile (shown inline, it goes
+      // once the account is unlocked), so it can still ask for a new passphrase after a recovery.
+      onUnlocked?.(k === 'recovery' ? 'recovered' : null);
+      return k;
     });
     if (kind) {
       setSecret('');
       if (kind === 'recovery') go({ kind: 'recovered' });
-      else onClose();
+      else if (!inline) onClose();
     }
   };
 
@@ -347,9 +393,15 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
   const formId = `${id}-form`;
   let title = 'Cloud encryption';
   let body: ReactNode;
-  let footer: ReactNode = (
-    <button type="button" className="btn" onClick={onClose}>
+  let footer: ReactNode = inline ? null : (
+    <button type="button" className="btn" onClick={close} disabled={!!busy}>
       Close
+    </button>
+  );
+  /** Inline, there's nothing to go back to: the account stays locked until it's unlocked. */
+  const notNow = inline ? null : (
+    <button type="button" className="btn" onClick={close} disabled={!!busy}>
+      Not now
     </button>
   );
   const busyNote = busy && (
@@ -414,7 +466,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
       </div>
     );
     footer = (
-      <button type="button" className="btn btn-primary" onClick={onClose}>
+      <button type="button" className="btn btn-primary" onClick={close}>
         Done
       </button>
     );
@@ -448,7 +500,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     );
     footer = (
       <>
-        <button type="button" className="btn" onClick={onClose}>
+        <button type="button" className="btn" onClick={close} disabled={!!busy}>
           Not now
         </button>
         <button type="submit" form={formId} className="btn btn-primary" disabled={!newPass.valid || !!busy}>
@@ -485,7 +537,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     );
     footer = (
       <>
-        <button type="button" className="btn" onClick={() => go({ kind: 'main' })}>
+        <button type="button" className="btn" onClick={() => !busy && go({ kind: 'main' })} disabled={!!busy}>
           Cancel
         </button>
         <button
@@ -514,6 +566,12 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     title = 'Turn on encrypted sync';
     body = (
       <div className="ei-panel">
+        {inline && (
+          <div className="alert alert-warning" role="status">
+            This account used end-to-end encryption, but its encryption settings are missing from the cloud. Set up
+            encryption again to open your data on this device.
+          </div>
+        )}
         <p className="ei-lead">
           Amendra encrypts your medications and dose history on this device before syncing them, so only you can read
           them. Not Google, and not the app's developer. Choose a sync passphrase: you'll enter it once on each new
@@ -532,9 +590,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     );
     footer = (
       <>
-        <button type="button" className="btn" onClick={onClose}>
-          Not now
-        </button>
+        {notNow}
         <button type="submit" form={formId} className="btn btn-primary" disabled={!newPass.valid || !!busy}>
           Continue
         </button>
@@ -550,8 +606,9 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
           </div>
         )}
         <p className="ei-lead">
-          Your synced data is end-to-end encrypted. Enter your sync passphrase to unlock this device. It stays unlocked
-          until you sign out. Until then, changes are kept on this device and upload once it's unlocked.
+          Your data is end-to-end encrypted. Enter your sync passphrase to unlock it on this device. It stays unlocked
+          until you sign out or forget the key here. Until then, your medications and dose history stay locked on this
+          device, and changes made here before it was locked upload once it's unlocked.
         </p>
         <form id={formId} className="ei-form" onSubmit={onUnlock} autoComplete="off">
           <div className="field">
@@ -582,6 +639,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
           <button
             type="button"
             className="btn btn-ghost btn-sm"
+            disabled={!!busy}
             onClick={() => {
               setUseRecovery((r) => !r);
               setSecret('');
@@ -590,7 +648,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
           >
             {useRecovery ? 'Use my passphrase instead' : 'Forgot it? Use your recovery key'}
           </button>
-          <button type="button" className="btn btn-ghost btn-sm" onClick={() => go({ kind: 'reset' })}>
+          <button type="button" className="btn btn-ghost btn-sm" disabled={!!busy} onClick={() => !busy && go({ kind: 'reset' })}>
             Lost both? Start over
           </button>
         </div>
@@ -600,9 +658,7 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     );
     footer = (
       <>
-        <button type="button" className="btn" onClick={onClose}>
-          Not now
-        </button>
+        {notNow}
         <button type="submit" form={formId} className="btn btn-primary" disabled={!secret || !!busy}>
           Unlock
         </button>
@@ -654,12 +710,12 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
         <section className="enc-section">
           <h3>This device</h3>
           <p className="field-hint">
-            Forgetting the key pauses sync here until you unlock again. Your data on this device is kept. Signing out
-            also forgets it.
+            Forgetting the key locks Amendra on this device: your data here is kept, encrypted, and opens again once you
+            enter your sync passphrase. Signing out also forgets it.
           </p>
           {confirmForget ? (
             <div className="enc-actions">
-              <button type="button" className="btn btn-sm" onClick={() => setConfirmForget(false)}>
+              <button type="button" className="btn btn-sm" onClick={() => setConfirmForget(false)} disabled={!!busy}>
                 Cancel
               </button>
               <button type="button" className="btn btn-danger btn-sm" onClick={onForget} disabled={!!busy}>
@@ -680,8 +736,17 @@ export function SyncEncryptionDialog({ status, controls, onClose }: Props) {
     );
   }
 
+  if (inline) {
+    return (
+      <section className="card lock-panel" aria-labelledby={`${id}-title`}>
+        <h2 id={`${id}-title`}>{title}</h2>
+        {body}
+        {footer && <div className="lock-actions">{footer}</div>}
+      </section>
+    );
+  }
   return (
-    <Modal title={title} onClose={busy ? () => undefined : onClose} footer={footer} maxWidth={560}>
+    <Modal title={title} onClose={busy ? () => undefined : close} footer={footer} maxWidth={560}>
       {body}
     </Modal>
   );

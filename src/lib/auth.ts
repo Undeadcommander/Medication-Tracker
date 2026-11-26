@@ -40,6 +40,15 @@ export const FIREBASE_CONFIGURED = Boolean(
   firebaseConfig.apiKey && firebaseConfig.authDomain && firebaseConfig.projectId && firebaseConfig.appId,
 );
 
+/** The Firebase app's name (the default one). */
+const FIREBASE_APP_NAME = '[DEFAULT]';
+/**
+ * How this app's Firestore names its offline cache: IndexedDB databases start with it, and its
+ * localStorage keys are "firestore_<kind>_<this>" (optionally followed by "_<id>"). Other Firebase
+ * apps on this origin (another project, or another app name) use their own.
+ */
+export const FIRESTORE_STORAGE_PREFIX = `firestore/${FIREBASE_APP_NAME}/${firebaseConfig.projectId}/`;
+
 const SESSION_KEY = 'medtracker.session';
 
 // Firebase is loaded lazily so guests and unconfigured builds never download it. The sign-in
@@ -54,7 +63,7 @@ function loadFirebase(): Promise<Loaded> {
   if (!FIREBASE_CONFIGURED) return Promise.reject(new Error('Firebase is not configured'));
   loadPromise ??= (async () => {
     const [{ initializeApp }, mod] = await Promise.all([import('firebase/app'), import('firebase/auth')]);
-    const app = initializeApp(firebaseConfig);
+    const app = initializeApp(firebaseConfig, FIREBASE_APP_NAME);
     const auth = mod.getAuth(app);
     auth.useDeviceLanguage();
     loaded = { app, auth, mod };
@@ -202,9 +211,12 @@ export async function signInWithGoogle(): Promise<User | null> {
   }
 }
 
-/** Finish a redirect sign-in that just returned to the app, surfacing its errors. */
-export async function completeRedirectSignIn(): Promise<void> {
-  if (!FIREBASE_CONFIGURED) return;
+/**
+ * Finish a redirect sign-in that just returned to the app, surfacing its errors. Resolves with the
+ * account signed in to by it (null if none just returned).
+ */
+export async function completeRedirectSignIn(): Promise<User | null> {
+  if (!FIREBASE_CONFIGURED) return null;
   const { auth, mod } = await loadFirebase();
   const pending = lastSignInAttempt();
   try {
@@ -212,6 +224,7 @@ export async function completeRedirectSignIn(): Promise<void> {
     if (pending?.method === 'redirect' && pending.result === 'started') {
       recordAttempt({ result: cred || auth.currentUser ? 'ok' : 'redirect-returned-empty' });
     }
+    return cred ? toUser(cred.user) : null;
   } catch (e) {
     recordAttempt({ result: 'error', code: (e as { code?: string })?.code ?? 'unknown' });
     throw friendlyError(e);
@@ -312,7 +325,10 @@ export async function deleteFirebaseUser(): Promise<void> {
   try {
     await mod.deleteUser(auth.currentUser);
   } catch (e) {
-    if ((e as { code?: string })?.code === 'auth/requires-recent-login') {
+    const code = (e as { code?: string })?.code;
+    // Removed already (e.g. by another device finishing its deletion): nothing left to do.
+    if (code === 'auth/user-not-found' || code === 'auth/user-token-expired') return;
+    if (code === 'auth/requires-recent-login') {
       throw new Error('For your security, Google needs you to confirm your account again. Try once more.');
     }
     throw friendlyError(e);

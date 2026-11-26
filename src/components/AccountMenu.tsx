@@ -5,8 +5,9 @@ import type { SyncStatus } from '../lib/sync';
 interface Props {
   user: User;
   syncStatus?: SyncStatus | null;
-  onNotifications: () => void;
-  onExportImport: () => void;
+  /** Left out while the account is locked (nothing of its data is available then). */
+  onNotifications?: () => void;
+  onExportImport?: () => void;
   /** Cloud encryption settings (signed-in accounts only). */
   onEncryption?: () => void;
   onSignOut: () => void;
@@ -103,9 +104,11 @@ export function AccountMenu({ user, syncStatus, onNotifications, onExportImport,
               )}
             </div>
           </div>
-          <button type="button" role="menuitem" className="account-item" onClick={choose(onNotifications)}>
-            🔔 Notification settings
-          </button>
+          {onNotifications && (
+            <button type="button" role="menuitem" className="account-item" onClick={choose(onNotifications)}>
+              🔔 Notification settings
+            </button>
+          )}
           {syncStatus?.warning && (
             <div className="account-sync-warning" role="status">
               ⚠ {syncStatus.warning}
@@ -116,9 +119,11 @@ export function AccountMenu({ user, syncStatus, onNotifications, onExportImport,
               {syncStatus?.lock === 'locked' ? '🔑 Unlock cloud sync' : syncStatus?.lock === 'needs-setup' ? '🔑 Set up encrypted sync' : '🔑 Cloud encryption'}
             </button>
           )}
-          <button type="button" role="menuitem" className="account-item" onClick={choose(onExportImport)}>
-            🔐 Export / import data
-          </button>
+          {onExportImport && (
+            <button type="button" role="menuitem" className="account-item" onClick={choose(onExportImport)}>
+              🔐 Export / import data
+            </button>
+          )}
           <button type="button" role="menuitem" className="account-item" onClick={choose(onSignOut)}>
             {user.provider === 'guest' ? '↪ Sign in with Google' : '↪ Sign out'}
           </button>

@@ -81,16 +81,37 @@ service cloud.firestore {
         && (isEnvelope(request.resource.data) || isMedTombstone(request.resource.data))
         && (resource == null || resource.data.get('deleted', false) != true);
 
+      // Documents of the older monthly layout may only shrink: versions from before encryption
+      // wrote plaintext entries there, so nothing may be added or changed in them.
+      function legacyShrinkOk() {
+        let change = request.resource.data.logs.diff(resource.data.get('logs', {}));
+        return request.resource.data.keys().hasOnly(['logs'])
+          && change.addedKeys().size() == 0
+          && change.changedKeys().size() == 0;
+      }
+
       allow create, update: if isOwner() && collection == 'logs' && !accountClosed()
         && request.resource.data.logs is map
         && request.resource.data.logs.size() <= 5000
         && ((isShard(docId) && shardWriteOk())
-          || (isLegacyLogDoc(docId) && request.resource.data.keys().hasOnly(['logs'])));
+          || (isLegacyLogDoc(docId) && resource != null && legacyShrinkOk()));
+
+      // While an account is being deleted, its marker stays: nothing (such as a key reset finishing
+      // on another device) may replace it with encryption settings, or other devices would resume
+      // syncing into the account being deleted. The one exception is the deleting device putting
+      // the settings back after its deletion failed, which it shows by naming the marker's `at`.
+      function deletionMarkerKept() {
+        return resource == null
+          || resource.data.get('deleted', false) != true
+          || request.resource.data.get('deleted', false) == true
+          || ('at' in resource.data && request.resource.data.get('undo', null) == resource.data.at);
+      }
 
       // Once an account's deletion is done, the marker is permanent.
       allow create, update: if isOwner() && collection == 'meta' && docId == 'crypto'
         && request.resource.data.v == 1
-        && (resource == null || resource.data.get('done', false) != true);
+        && (resource == null || resource.data.get('done', false) != true)
+        && deletionMarkerKept();
     }
   }
 }

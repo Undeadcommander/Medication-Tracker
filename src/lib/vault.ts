@@ -6,6 +6,7 @@
  * header is bound to the ciphertext as AES-GCM additional data so any header tampering is detected.
  * No data, passphrase, or key ever leaves the device, and nothing here is logged.
  */
+import type { ZxcvbnResult } from '@zxcvbn-ts/core';
 import type { AppData, DoseLog, DrugInfo, Medication, Schedule } from '../../shared/types';
 import { MED_FIELD_GROUPS, mergeMed } from './supply';
 
@@ -571,44 +572,158 @@ function randomInt(n: number): number {
   }
 }
 
+const MIN_GENERATED_WORDS = 6;
+const MIN_DISTINCT_GENERATED_WORDS = 4;
+
 export function generatePassphrase(words = 6): string {
   const count = Math.max(1, Math.min(32, Math.floor(words)));
-  const out: string[] = [];
-  for (let i = 0; i < count; i++) out.push(WORDS[randomInt(WORDS.length)]!);
-  return out.join('-');
+  for (;;) {
+    const out: string[] = [];
+    for (let i = 0; i < count; i++) out.push(WORDS[randomInt(WORDS.length)]!);
+    // Words are drawn with replacement; a draw that's mostly repeats (about one in a million at six
+    // words) is drawn again, so the result is always one the strength check recognises as its own.
+    if (new Set(out).size >= Math.min(count, MIN_DISTINCT_GENERATED_WORDS)) return out.join('-');
+  }
 }
 
-export function estimatePassphraseStrength(p: string): { score: 0 | 1 | 2 | 3 | 4; label: string } {
-  const labels = ['Very weak', 'Weak', 'Fair', 'Strong', 'Very strong'] as const;
-  let bits = 0;
-  const seenWords = new Set<string>();
-  for (const token of p.split(/[\s\-_.,]+/).filter(Boolean)) {
-    const lower = token.toLowerCase();
-    if (WORD_SET.has(lower)) {
-      if (!seenWords.has(lower)) bits += Math.log2(WORDS.length);
-      seenWords.add(lower);
-      continue;
+// ---------------------------------------------------------------------------------------------
+// Passphrase strength
+// ---------------------------------------------------------------------------------------------
+//
+// zxcvbn (zxcvbn-ts, with its common and English dictionaries) does the rating, loaded on demand: it
+// and its dictionaries are about 1 MB, so they're a chunk of their own that's fetched the first
+// time a passphrase is being chosen. A passphrase is never rated, and so never accepted, before
+// that has loaded: `loadStrengthChecker()` rejects when it can't (offline), and callers treat that
+// as "can't check", never as "fine".
+
+export interface PassphraseStrength {
+  score: 0 | 1 | 2 | 3 | 4;
+  label: string;
+}
+
+const STRENGTH_LABELS = ['Very weak', 'Weak', 'Fair', 'Strong', 'Very strong'] as const;
+/** Only this much of a passphrase is rated (zxcvbn's cost grows with length). */
+const MAX_RATED_LENGTH = 128;
+
+type StrengthChecker = (passphrase: string) => PassphraseStrength;
+let strengthChecker: StrengthChecker | null = null;
+let strengthLoading: Promise<StrengthChecker> | null = null;
+
+/** Loads the strength checker. Resolves at once when it already has; a failure can be retried. */
+export function loadStrengthChecker(): Promise<void> {
+  if (strengthChecker) return Promise.resolve();
+  strengthLoading ??= import('./strengthEngine').then(
+    ({ createZxcvbn }) => (strengthChecker = createStrengthChecker(createZxcvbn())),
+    (e: unknown) => {
+      strengthLoading = null; // so the next call tries again
+      throw e;
+    },
+  );
+  return strengthLoading.then(() => undefined);
+}
+
+export function isStrengthCheckerLoaded(): boolean {
+  return strengthChecker !== null;
+}
+
+/** The rating once the checker has loaded, `null` before: callers must not accept on `null`. */
+export function rateLoadedPassphrase(passphrase: string): PassphraseStrength | null {
+  return strengthChecker ? strengthChecker(passphrase) : null;
+}
+
+/** Rates a passphrase, loading the checker first. Rejects when it can't be loaded. */
+export async function estimatePassphraseStrength(passphrase: string): Promise<PassphraseStrength> {
+  await loadStrengthChecker();
+  return strengthChecker!(passphrase);
+}
+
+type Zxcvbn = (password: string) => ZxcvbnResult;
+
+/** Separators people put between the words of a passphrase. */
+const TOKEN_SEPARATORS = /[\s\-_.,:;/|\\\u2010-\u2015\u00b7]+/u;
+const PATTERN_TYPES = new Set(['sequence', 'spatial', 'repeat']);
+const LEET: Record<string, string> = { '@': 'a', '4': 'a', '8': 'b', '3': 'e', '1': 'i', '0': 'o', $: 's', '5': 's', '7': 't' };
+
+/** What a token says once decoration is stripped: "Dog2" and "d0g1" both say "dog". */
+function tokenStem(token: string): string {
+  const lower = token.toLowerCase();
+  const bare = lower.replace(/\d+$/, '') || lower;
+  return bare.replace(/[@$0-9]/g, (c) => LEET[c] ?? c);
+}
+
+/** Is the whole of `text` explained by one repeat, run or keyboard walk? */
+function isPatternOnly(zx: Zxcvbn, text: string): boolean {
+  if (text.length < 3) return false;
+  const seq = zx(text).sequence;
+  return seq.length === 1 && PATTERN_TYPES.has(seq[0]!.pattern) && seq[0]!.token.length === text.length;
+}
+
+/**
+ * The generator's own output (`generatePassphrase`, 6 words by default): only lowercase words of
+ * the app's list joined by "-", six or more, at least 4 different. Drawn from a list of about
+ * 1,000, so a shared beginning ("sun-sunny"), a chance repeat or alphabetical order is possible
+ * and says nothing about it. This one narrow shape is exempt from the structure checks below (it
+ * still gets zxcvbn's own score).
+ */
+function isGeneratedShape(passphrase: string, tokens: string[]): boolean {
+  return (
+    tokens.length >= MIN_GENERATED_WORDS &&
+    /^[a-z]+(-[a-z]+)+$/.test(passphrase) &&
+    tokens.every((t) => WORD_SET.has(t)) &&
+    new Set(tokens).size >= MIN_DISTINCT_GENERATED_WORDS
+  );
+}
+
+/**
+ * zxcvbn's score, hardened against structure it doesn't see. Left alone it rates, as Very strong,
+ * things like "dog1 dog2 dog3 dog4", "apple:banana:cherry:grape" or "a1b2c3d4e5f6g7h8": it takes
+ * each piece as a fresh pick, and charges any unknown 10-character string like a strong secret.
+ * Each rule below can only lower the score.
+ */
+function createStrengthChecker(zx: Zxcvbn): StrengthChecker {
+  return (input) => {
+    const p = input.slice(0, MAX_RATED_LENGTH);
+    if (!p) return { score: 0, label: STRENGTH_LABELS[0] };
+    const tokens = p.split(TOKEN_SEPARATORS).filter(Boolean);
+    const raw = zx(p);
+    let score: number = raw.score;
+    if (!isGeneratedShape(p, tokens)) {
+      // 1. A token counts once, whatever its case, leetspeak, trailing counter or ending: "the-the-the",
+      //    "dog1 dog2 dog3", "p4ssw0rd pa55word", "apple apples applesauce" are each one pick.
+      if (tokens.length > 1) {
+        const stems = [...new Set(tokens.map(tokenStem))].sort((a, b) => a.length - b.length);
+        const kept: string[] = [];
+        for (const s of stems) if (!kept.some((k) => k.length >= 4 && s.startsWith(k))) kept.push(s);
+        if (kept.length < tokens.length) score = Math.min(score, zx(kept.join(' ')).score);
+      }
+      // 2. Words in alphabetical order (either way) are a list, not four independent picks.
+      if (tokens.length >= 4) {
+        const t = tokens.map((x) => x.toLowerCase());
+        const up = t.every((x, i) => i === 0 || t[i - 1]! <= x);
+        const down = t.every((x, i) => i === 0 || t[i - 1]! >= x);
+        if (up || down) score = Math.min(score, 1);
+      }
+      // 3. Mostly keyboard walks / runs / repeats ("qwe asd zxc rty").
+      if (tokens.length >= 3) {
+        const patterned = tokens.slice(0, 16).filter((t) => isPatternOnly(zx, t)).length;
+        if (patterned * 2 >= Math.min(tokens.length, 16)) score = Math.min(score, 1);
+      }
+      // 4. Two interleaved runs ("a1b2c3d4", "aAbBcCdD", "1q2w3e4r").
+      if (p.length >= 8) {
+        const streams = [[], []] as string[][];
+        [...p].forEach((ch, i) => streams[i % 2]!.push(ch));
+        if (streams.some((s) => s.length >= 4 && isPatternOnly(zx, s.join('')))) score = Math.min(score, 1);
+      }
+      // 5. Mostly a word in leetspeak ("P@ssw0rd", "Th1sIsMyP4ssw0rd"): the first thing guessed.
+      const leet = raw.sequence.reduce((n, m) => n + ('l33t' in m && m.l33t ? m.token.length : 0), 0);
+      if (leet * 2 >= p.length) score = Math.min(score, 2);
+      // 6. zxcvbn charges any run of characters it can't explain 10^length whatever it is, so every
+      //    10-character string looks strong ("Tr0ub4dor&3"). Short ones can't be better than Fair.
+      if (p.length < 12) score = Math.min(score, 2);
     }
-    let pool = 0;
-    if (/[a-z]/.test(token)) pool += 26;
-    if (/[A-Z]/.test(token)) pool += 26;
-    if (/\d/.test(token)) pool += 10;
-    if (/[^A-Za-z0-9]/.test(token)) pool += 33;
-    const perChar = Math.log2(Math.max(pool, 2));
-    const seenChars = new Set<string>();
-    let prev = -2;
-    for (const ch of token) {
-      const code = ch.codePointAt(0)!;
-      // Repeats and simple runs (abc, 123, aaa) add almost no entropy.
-      const predictable = seenChars.has(ch) || Math.abs(code - prev) <= 1;
-      bits += predictable ? 0.5 : perChar;
-      seenChars.add(ch);
-      prev = code;
-    }
-  }
-  if (/password|passw0rd|qwerty|letmein|123456|iloveyou|admin/i.test(p)) bits = Math.min(bits, 20);
-  const score = bits < 28 ? 0 : bits < 45 ? 1 : bits < 60 ? 2 : bits < 75 ? 3 : 4;
-  return { score, label: labels[score] };
+    const s = Math.max(0, Math.min(4, score)) as PassphraseStrength['score'];
+    return { score: s, label: STRENGTH_LABELS[s] };
+  };
 }
 
 // prettier-ignore

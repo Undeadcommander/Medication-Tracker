@@ -1,5 +1,9 @@
 // Local, per-account persistence of medications and dose history (IndexedDB, see localDb.ts),
 // shared live between this device's open tabs.
+//
+// An account with end-to-end encrypted sync is only loaded once it's unlocked on this device:
+// until then (and while it's being checked whether it uses encryption) nothing of its data is
+// read, shown, edited or used for reminders. See dataAccess().
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppData, DoseLog, DoseStatus, Medication } from '../../shared/types';
 import {
@@ -7,19 +11,32 @@ import {
   changesBetween,
   deleteAccount,
   hasChanges,
+  isSealed,
   loadAccount,
+  LocalCopyLockedError,
   localDbAvailable,
   replaceAccount,
   writeChanges,
   type Changes,
 } from './localDb';
 import { logsByMed, stampEdit, supplyOnHand, unitsPerDose } from './supply';
-import { preloadSync, startSync, type SyncHandle, type SyncStatus } from './sync';
+import { accountDeletedSince, checkDeletedElsewhere, deletionMark, holdSession, isAccountDeleted } from './session';
+import { loadDeviceKey } from './keyStore';
+import { legacyDataKey, sealLocal, unsealLocal, withLoadLock } from './localSeal';
+import {
+  discardIfSynced,
+  encryptionMarker,
+  localCopySettled,
+  preloadSync,
+  releaseSyncClient,
+  startSync,
+  type SyncHandle,
+  type UnlockedKey,
+  type SyncStatus,
+} from './sync';
+import { SyncCryptoError } from './syncCrypto';
 import { LOG_RETENTION_MS } from './syncOps';
 import { mergeAppData } from './vault';
-
-/** Where older versions kept everything, as one localStorage string per account. */
-const LEGACY_PREFIX = 'medtracker.data.';
 
 export const EMPTY_DATA: AppData = { version: 1, medications: [], doseLogs: [] };
 
@@ -31,9 +48,7 @@ export function newId(): string {
 
 // ---------- legacy localStorage copy (read once to migrate; also the fallback without IndexedDB) ----------
 
-function legacyKey(userId: string) {
-  return LEGACY_PREFIX + userId;
-}
+const legacyKey = legacyDataKey;
 
 function parseData(raw: string | null): AppData | null {
   try {
@@ -84,12 +99,18 @@ function dataChannel(): BroadcastChannel | null {
 
 /** Remove an account's medications and dose history from this device (and its other tabs). */
 export async function deleteLocalData(userId: string): Promise<void> {
-  removeLegacy(userId);
-  try {
-    await deleteAccount(userId);
-  } catch {
-    /* storage unavailable */
-  }
+  // Under the load lock: a load, lock or unlock of this device's copy that's under way in any tab
+  // (they hold it) finishes first, so it can't write plaintext or an encrypted copy back afterwards.
+  // Rejects if it couldn't be removed (it mustn't count as removed: it would come back), unless
+  // IndexedDB can't be used here at all (nothing was stored there; see loadForUser).
+  await withLoadLock(userId, async () => {
+    removeLegacy(userId);
+    try {
+      await deleteAccount(userId);
+    } catch (e) {
+      if (await localDbAvailable()) throw e;
+    }
+  });
   dataChannel()?.postMessage({ userId, from: tabId, cleared: true } satisfies TabMessage);
 }
 
@@ -97,22 +118,104 @@ function isOld(l: DoseLog, cutoff: number) {
   return Date.parse(l.scheduledFor) < cutoff;
 }
 
+/** A load that's no longer wanted (closed, or sync stopped, meanwhile): nothing was loaded. */
+class LoadAbandonedError extends Error {}
+
 /**
  * Load an account's data: from IndexedDB, migrating the old localStorage copy the first time, and
  * taking over guest data when a signed-in account has none yet. Old dose history is dropped.
+ * `unlocked`: the account is unlocked: `key()` is its key now (null once it isn't), to put back the
+ * copy encrypted while it was locked; `wanted()`: this load is still wanted.
+ *
+ * Another tab may lock the copy (encrypt it, forgetting the key) before this load gets its turn.
+ * Then it's not put back: this rejects with LocalCopyLockedError (or LoadAbandonedError, if it's no
+ * longer wanted anyway) and loads nothing.
  */
-async function loadForUser(userId: string): Promise<{ data: AppData; persistent: boolean }> {
+async function loadForUser(
+  userId: string,
+  unlocked?: { uid: string; key: () => UnlockedKey | null; wanted: () => boolean },
+  /** Still wanted (not signed out or deleted meanwhile): checked once it's this load's turn. */
+  wanted: () => boolean = () => true,
+): Promise<{ data: AppData; persistent: boolean }> {
+  // Without a stored key to go by: whether the copy was already locked when this load began.
+  const sealedBefore = unlocked && !unlocked.key()?.stored ? isSealed(userId).catch(() => true) : null;
+  // Not while this account's copy is still being locked after a sign-out elsewhere.
+  if (unlocked) await localCopySettled(unlocked.uid);
   if (!(await localDbAvailable())) return { data: readLegacy(userId) ?? EMPTY_DATA, persistent: false };
   // One tab at a time per account, so two tabs opening together can't both migrate or adopt.
-  const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined;
-  const run = () => loadAndTidy(userId).then((data) => ({ data, persistent: true }));
-  return locks ? locks.request(`medtracker-load-${userId}`, run) : run();
+  return withLoadLock(userId, async () => {
+    // Deleted (or signed out) while this waited: it's been cleared, nothing is written back (e.g.
+    // a guest's data taken over into the deleted account).
+    if (!wanted()) throw new LoadAbandonedError();
+    if (unlocked) {
+      // Locked in another tab while this waited its turn (it forgets the stored key, see
+      // sync.ts secure and forgetKey; without one, the copy is newly marked encrypted), or no
+      // longer wanted: then the copy stays encrypted.
+      const k = unlocked.key();
+      if (!k || !unlocked.wanted()) throw new LoadAbandonedError();
+      const lockedSince = k.stored
+        ? (await loadDeviceKey(unlocked.uid))?.keyId !== k.keyId
+        : !(await sealedBefore) && (await isSealed(userId).catch(() => true));
+      if (!unlocked.wanted() || unlocked.key()?.key !== k.key) throw new LoadAbandonedError();
+      if (lockedSince) throw new LocalCopyLockedError();
+      // First, so a guest's data is only taken over if the account really has none.
+      await unsealLocal(userId, unlocked.uid, k.key, k.keyId).catch(() => {});
+    }
+    return { data: await loadAndTidy(userId, wanted), persistent: true };
+  });
+}
+
+/**
+ * Whether an account's data may be loaded and shown on this device. Without cloud sync (a guest)
+ * it always may. A synced account may once it's unlocked, or once the cloud has said it doesn't
+ * use encryption (remembered, so that also works offline). An account seen to use encryption is
+ * `locked` until unlocked; one whose settings haven't been seen yet is `checking`.
+ */
+export type DataAccess = 'open' | 'checking' | 'locked';
+
+export function dataAccess(syncUid: string | undefined, status: SyncStatus | null): DataAccess {
+  if (!syncUid) return 'open';
+  const lock = status?.lock ?? 'checking';
+  if (lock === 'unlocked') return 'open';
+  if (lock === 'locked') return 'locked';
+  const marker = encryptionMarker(syncUid);
+  // Encryption was on but its settings are gone from the cloud: set it up again first.
+  if (lock === 'needs-setup') return marker === 'on' ? 'locked' : 'open';
+  return marker === 'off' ? 'open' : 'checking';
+}
+
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+  done: boolean;
+}
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const d: Deferred = { promise: new Promise<void>((r) => (resolve = r)), resolve: () => {}, done: false };
+  d.resolve = () => {
+    d.done = true;
+    resolve();
+  };
+  return d;
 }
 
 /** A recount at least this often keeps every dose since the count within the kept history. */
 const RECOUNT_AFTER_MS = 330 * 86_400_000;
 
-async function loadAndTidy(userId: string): Promise<AppData> {
+/**
+ * This device has changes the cloud copy hasn't seen that aren't queued for upload: the next sync
+ * merges this device's data in, instead of treating the cloud as up to date (signing out waits for that).
+ */
+function unmerge(userId: string): void {
+  if (userId === 'guest') return;
+  try {
+    localStorage.removeItem(`medtracker.synced.${userId.replace(/^firebase:/, '')}`);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function loadAndTidy(userId: string, wanted: () => boolean = () => true): Promise<AppData> {
   let data = await loadAccount(userId);
   const empty = (d: AppData) => !d.medications.length && !d.doseLogs.length;
   // A localStorage copy: from an older version, or saved here while IndexedDB couldn't be used.
@@ -120,9 +223,11 @@ async function loadAndTidy(userId: string): Promise<AppData> {
   if (legacy && !empty(legacy)) {
     data = empty(data) ? legacy : mergeAppData(data, legacy);
     await replaceAccount(userId, data);
+    unmerge(userId);
   }
   removeLegacy(userId);
-  if (userId !== 'guest' && !data.medications.length) {
+  // (Not a guest's data that was deleted: what's left of it is being removed, see account.ts.)
+  if (userId !== 'guest' && !data.medications.length && wanted() && !isAccountDeleted('guest')) {
     // Signed in on a device that was used as a guest: the guest data becomes this account's.
     const guest = await loadAccount('guest');
     const guestData = guest.medications.length ? guest : readLegacy('guest');
@@ -131,13 +236,7 @@ async function loadAndTidy(userId: string): Promise<AppData> {
       await deleteAccount('guest');
       removeLegacy('guest');
       data = guestData;
-      // The cloud copy doesn't have it: the next sync merges this device's data in, instead of
-      // treating the cloud as up to date (which would drop the guest's dose history).
-      try {
-        localStorage.removeItem(`medtracker.synced.${userId.replace(/^firebase:/, '')}`);
-      } catch {
-        /* ignore */
-      }
+      unmerge(userId); // the cloud copy doesn't have it (and a merge keeps the guest's dose history)
     }
   }
   const nowMs = Date.now();
@@ -148,6 +247,7 @@ async function loadAndTidy(userId: string): Promise<AppData> {
       ? stampEdit(m, { ...m, supplyRemaining: supplyOnHand(m, data.doseLogs) ?? 0, supplyCountedAt: new Date(nowMs).toISOString() })
       : m,
   );
+  if (medications.some((m, i) => m !== data.medications[i])) unmerge(userId); // recounted
   const cutoff = nowMs - LOG_RETENTION_MS;
   const doseLogs = data.doseLogs.some((l) => isOld(l, cutoff)) ? data.doseLogs.filter((l) => !isOld(l, cutoff)) : data.doseLogs;
   const next = { version: 1 as const, medications, doseLogs };
@@ -201,7 +301,8 @@ function countedFromNow(meds: Medication[], med: Medication, changed: DoseLog | 
   const restore = changed?.status === 'taken' ? (changed.supplyDeducted ?? 0) : 0;
   const counted = stampEdit(med, {
     ...med,
-    supplyRemaining: med.supplyRemaining + restore,
+    // (An older version's count could be below zero; what was shown was none on hand.)
+    supplyRemaining: Math.max(0, med.supplyRemaining) + restore,
     supplyCountedAt: new Date(nowMs - 1).toISOString(),
   });
   return meds.map((m) => (m.id === med.id ? counted : m));
@@ -268,13 +369,28 @@ export function prepareImport(current: AppData, incoming: AppData, deletedInClou
 /**
  * The signed-in account's data. Edits are saved to this device right away and shown in its other
  * tabs; when `syncUid` is given (a Google account) they're also synced to the cloud, and edits
- * from other devices arrive.
+ * from other devices arrive. Nothing is loaded (or can be edited) while `access` isn't open.
+ * `mark`: the account's deletion mark when the app took it up (default: now); the session ends if
+ * it's deleted since (see session.ts).
  */
-export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: () => void) {
+export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: () => void, mark?: string | null) {
   const [data, setDataState] = useState<AppData>(EMPTY_DATA);
   const [loaded, setLoaded] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  /** The key is being forgotten here: closed while this device's copy is encrypted. */
+  const [sealing, setSealing] = useState(false);
+  /**
+   * Forgetting the key here failed (this device's copy couldn't be encrypted), or another tab locked
+   * it before this one heard: what happened, for the user (until dismissed).
+   */
+  const [lockError, setLockError] = useState<string | null>(null);
+  /** Bumped to load this device's copy again (encrypting it failed, so it's shown again). */
+  const [reloads, setReloads] = useState(0);
+  const access: DataAccess = sealing ? 'locked' : dataAccess(syncUid, syncStatus);
+  const open = access === 'open';
+  /** Resolves once this device's copy is loaded (and while it stays loaded); sync waits for it. */
+  const readyRef = useRef<Deferred>(deferred());
   // The latest state, updated synchronously so each edit is diffed against what preceded it.
   const dataRef = useRef(data);
   const loadedRef = useRef(false);
@@ -285,66 +401,200 @@ export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: 
   const [syncControls, setSyncControls] = useState<SyncHandle | null>(null);
   const onAccountDeletedRef = useRef(onAccountDeleted);
   onAccountDeletedRef.current = onAccountDeleted;
+  /** Signed out (here or in another tab): nothing more is saved or synced, so the wipe stays wiped. */
+  const endedRef = useRef(false);
+  /** The account's deletion mark when this session started: a new one means it was deleted since. */
+  // (The app's, when given: a deletion between its check and this one isn't taken as the start.)
+  const [sessionMark] = useState(() => (mark !== undefined ? mark : deletionMark(userId)));
+  /**
+   * Signed out, or the account deleted since this session started (in any tab, told or not: a tab
+   * that slept through it finds out here, before it saves anything). Ends the session if so.
+   */
+  const ended = useCallback(() => {
+    if (endedRef.current) return true;
+    if (!accountDeletedSince(userId, sessionMark)) return false;
+    endedRef.current = true;
+    // Stopped at once, not after the session's end below has waited for saves: whatever sync is in
+    // the middle of (e.g. merging a snapshot) mustn't queue or keep anything for the deleted account.
+    loadedRef.current = false;
+    syncRef.current?.stop();
+    checkDeletedElsewhere(); // ends this tab's session of it and tells the app
+    return true;
+  }, [userId, sessionMark]);
+  const endedFnRef = useRef(ended);
+  endedFnRef.current = ended;
+  /** Settles once edits being saved now are saved and handed to sync (or refused). */
+  const savingRef = useRef<Promise<unknown>>(Promise.resolve());
+
+  /**
+   * This device's copy was locked in another tab before this one heard (a save was refused, see
+   * localDb storeSealed): stop using it here and say so. Nothing refused is queued for upload.
+   */
+  const lockedOutRef = useRef(false);
+  const lockedOut = useCallback((edit: boolean) => {
+    loadedRef.current = false;
+    lockedOutRef.current = true; // (said until unlocked again)
+    setLockError(
+      edit
+        ? "Amendra was locked in another tab, so your last change wasn't saved. Unlock to keep going."
+        : 'Amendra was locked in another tab.',
+    );
+    syncRef.current?.lockedElsewhere();
+  }, []);
 
   const show = useCallback((next: AppData) => {
     dataRef.current = next;
     setDataState(next);
   }, []);
 
-  /** Save to this device and tell its other tabs. */
+  /**
+   * Save to this device and tell its other tabs. Resolves false if it was refused because this
+   * device's copy was locked in another tab meanwhile (nothing was saved; see lockedOut), else true
+   * (saved, or failing to save is shown, and the next save writes everything).
+   */
   const persist = useCallback(
-    (prev: AppData, next: AppData) => {
+    (prev: AppData, next: AppData, edit: boolean): Promise<boolean> => {
+      if (ended()) return Promise.resolve(false);
       if (!persistentRef.current) {
         setSaveError(!writeLegacy(userId, next));
-        return;
+        return Promise.resolve(true);
       }
       const changes = changesBetween(prev, next);
-      if (!hasChanges(changes)) return;
+      if (!hasChanges(changes)) return Promise.resolve(true);
       const full = dirtyRef.current;
       dirtyRef.current = false;
-      (full ? replaceAccount(userId, next) : writeChanges(userId, changes)).then(
-        () => setSaveError(false),
+      const tell = () => dataChannel()?.postMessage({ userId, from: tabId, changes } satisfies TabMessage);
+      return (full ? replaceAccount(userId, next) : writeChanges(userId, changes)).then(
         () => {
+          setSaveError(false);
+          tell();
+          return true;
+        },
+        (e) => {
+          if (e instanceof LocalCopyLockedError) {
+            lockedOut(edit);
+            return false;
+          }
           dirtyRef.current = true;
           setSaveError(true);
+          tell();
+          return true;
         },
       );
-      dataChannel()?.postMessage({ userId, from: tabId, changes } satisfies TabMessage);
     },
-    [userId],
+    [userId, lockedOut, ended],
   );
 
   /** Data from the cloud: show it and save it here. */
   const applyRemote = useCallback(
     (next: AppData) => {
+      if (!loadedRef.current || ended()) return; // locked meanwhile (or signed out)
       const prev = dataRef.current;
       if (next === prev) return;
       show(next);
-      persist(prev, next);
+      void persist(prev, next, false);
     },
-    [show, persist],
+    [show, persist, ended],
   );
 
   /** A local edit: save it, show it, and hand the change to cloud sync. */
   const commit = useCallback(
     (fn: (d: AppData) => AppData) => {
-      if (!loadedRef.current) return; // nothing to edit yet
+      // Nothing to edit yet (loading, or locked), or signed out (or deleted, even if not told yet).
+      if (!loadedRef.current || ended()) return;
       const prev = dataRef.current;
       const next = fn(prev);
       if (next === prev) return;
       show(next);
-      persist(prev, next);
-      syncRef.current?.push(prev, next);
+      // Queued for upload only once it's saved here (not at all if that's refused).
+      const saved = persist(prev, next, true);
+      syncRef.current?.push(prev, next, saved);
+      const handedOver = saved.then(() => {}); // (after sync has it, see push)
+      savingRef.current = Promise.all([savingRef.current, handedOver]);
     },
-    [show, persist],
+    [show, persist, ended],
   );
 
-  // Load, and follow edits made in this device's other tabs.
+  // Cloud sync. Started straight away: it tells whether the account is locked. Cloud data is only
+  // merged in once this device's copy has loaded (localReady), so the first merge sees it.
+  useEffect(() => {
+    if (endedRef.current) return;
+    if (!syncUid) {
+      setSyncStatus(null);
+      setSyncControls(null);
+      return;
+    }
+    const handle = startSync({
+      uid: syncUid,
+      getLocal: () => dataRef.current,
+      applyRemote,
+      onStatus: setSyncStatus,
+      onAccountDeleted: () => onAccountDeletedRef.current?.(),
+      // Signed out, or deleted in any tab (told or not): nothing more is queued, kept or uploaded.
+      isEnded: () => endedFnRef.current(),
+      localReady: () => readyRef.current.promise,
+      localHidden: () => !loadedRef.current,
+      sealLocal: async (key, keyId, { elsewhere = false, unless, onSealed } = {}) => {
+        // Stop showing and saving the data first, so nothing readable is written back afterwards.
+        loadedRef.current = false;
+        setSealing(true);
+        setLockError(null);
+        lockedOutRef.current = false;
+        try {
+          // Without IndexedDB it can't be kept encrypted here: then only if the cloud has all of it
+          // (it's removed, and comes back once unlocked).
+          const sealed = await sealLocal(userId, syncUid, key, keyId, { unless, sealed: onSealed });
+          if (!sealed && !(await discardIfSynced(userId, syncUid))) throw new Error("This device's copy can't be encrypted here.");
+        } catch (e) {
+          // Nothing was changed: it stays unlocked (see forgetKey), so show the data again.
+          setSealing(false);
+          setReloads((n) => n + 1);
+          if (!elsewhere) setLockError(new SyncCryptoError('lock-failed').message);
+          throw e;
+        }
+      },
+    });
+    syncRef.current = handle;
+    setSyncControls(handle);
+    return () => {
+      handle.stop();
+      if (syncRef.current === handle) syncRef.current = null;
+      setSyncControls((h) => (h === handle ? null : h));
+    };
+  }, [userId, syncUid, applyRemote]);
+
+  // Done encrypting this device's copy: the lock (no longer unlocked) keeps it closed from here.
+  const lock = syncStatus?.lock;
+  useEffect(() => {
+    if (lock !== 'unlocked') setSealing(false);
+    else if (lockedOutRef.current) {
+      // Unlocked again: "locked in another tab" no longer applies.
+      lockedOutRef.current = false;
+      setLockError(null);
+    }
+  }, [lock]);
+
+  // Locked with a readable copy here and no key to encrypt it with (e.g. from before this was
+  // done): remove it if the cloud has all of it. Unlocking brings it back.
+  useEffect(() => {
+    if (lock === 'locked' && syncUid && !endedRef.current) void discardIfSynced(userId, syncUid);
+  }, [lock, userId, syncUid]);
+
+  // Load once open, and follow edits made in this device's other tabs. Closed (locked): the data
+  // is dropped from memory.
   useEffect(() => {
     let cancelled = false;
     loadedRef.current = false;
     setLoaded(false);
     show(EMPTY_DATA);
+    if (!open) {
+      if (readyRef.current.done) readyRef.current = deferred();
+      return;
+    }
+    if (ended()) return;
+    const handle = syncUid ? syncRef.current : null;
+    /** Still unlocked, and this load still wanted (see loadForUser). */
+    const wanted = () => !cancelled && !ended() && syncRef.current === handle;
     /** Messages from other tabs that arrive while loading: applied once loaded. */
     let early: TabMessage[] | null = [];
     const onMessage = (e: MessageEvent<TabMessage>) => {
@@ -363,10 +613,28 @@ export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: 
     };
     window.addEventListener('storage', onStorage);
 
-    loadForUser(userId)
-      .catch(() => ({ data: readLegacy(userId) ?? EMPTY_DATA, persistent: false }))
-      .then(({ data: loadedData, persistent }) => {
-        if (cancelled) return;
+    loadForUser(
+      userId,
+      handle?.dataKey() && syncUid ? { uid: syncUid, key: () => handle.dataKey(), wanted } : undefined,
+      () => !cancelled && !ended(),
+    )
+      // Locked in another tab meanwhile: not kept readable elsewhere instead.
+      .catch((e) =>
+        e instanceof LoadAbandonedError
+          ? undefined
+          : e instanceof LocalCopyLockedError
+            ? null
+            : { data: readLegacy(userId) ?? EMPTY_DATA, persistent: false },
+      )
+      .then((result) => {
+        if (cancelled || ended()) return;
+        if (result === undefined) {
+          // Given up because the key changed while it waited (still open): load again with this one.
+          if (!endedRef.current && syncRef.current === handle && handle?.dataKey()) setReloads((n) => n + 1);
+          return;
+        }
+        if (!result) return lockedOut(false);
+        const { data: loadedData, persistent } = result;
         persistentRef.current = persistent;
         let d = loadedData;
         for (const msg of early ?? []) d = 'cleared' in msg ? EMPTY_DATA : applyChanges(d, msg.changes);
@@ -374,41 +642,48 @@ export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: 
         show(d);
         loadedRef.current = true;
         setLoaded(true);
+        readyRef.current.resolve();
+        // Shown again (e.g. encrypting it failed): edits queued while it was hidden go up now.
+        syncRef.current?.localShown?.();
       });
     return () => {
       cancelled = true;
+      loadedRef.current = false;
       ch?.removeEventListener('message', onMessage);
       window.removeEventListener('storage', onStorage);
     };
-  }, [userId, show]);
+  }, [userId, syncUid, open, show, reloads, lockedOut, ended]);
 
   // Fetch the sync code and open Firestore's cache while this device's copy is still loading.
   useEffect(() => {
     if (syncUid) preloadSync();
   }, [syncUid]);
 
-  // Cloud sync (once this device's copy is loaded, so the first merge sees it).
+  // Signing out or deleting the account (in this tab or another) clears this device: stop saving
+  // and syncing first, and let a load already under way finish, so nothing is written back
+  // afterwards. Another tab is also deleting Firestore's offline cache, which waits for this tab's
+  // copy to close. (Guests too: deleting a guest's data in another tab ends it here.)
   useEffect(() => {
-    if (!syncUid || !loaded) {
-      setSyncStatus(null);
-      setSyncControls(null);
-      return;
-    }
-    const handle = startSync({
-      uid: syncUid,
-      getLocal: () => dataRef.current,
-      applyRemote,
-      onStatus: setSyncStatus,
-      onAccountDeleted: () => onAccountDeletedRef.current?.(),
-    });
-    syncRef.current = handle;
-    setSyncControls(handle);
-    return () => {
-      handle.stop();
-      if (syncRef.current === handle) syncRef.current = null;
-      setSyncControls((h) => (h === handle ? null : h));
-    };
-  }, [syncUid, loaded, applyRemote]);
+    return holdSession(
+      userId,
+      async (elsewhere) => {
+        endedRef.current = true;
+        // Sync stops first: a snapshot it's in the middle of mustn't queue, keep or upload anything
+        // while the saves below finish. (Edits being saved still reach the upload queue, see push.)
+        syncRef.current?.stop();
+        await savingRef.current.catch(() => {});
+        await navigator.locks?.request(`medtracker-load-${userId}`, () => {}).catch(() => {});
+        if (elsewhere) {
+          // Nothing of it stays in memory here (this tab's own sign-out keeps it on screen till done).
+          loadedRef.current = false;
+          show(EMPTY_DATA);
+          if (syncUid) await releaseSyncClient();
+        }
+      },
+      { mark: sessionMark },
+    );
+  }, [userId, syncUid, sessionMark, show]);
+
 
   const saveMedication = useCallback(
     (med: Medication, supplyShownAs?: number) => commit((d) => applySaveMedication(d, med, supplyShownAs)),
@@ -442,7 +717,28 @@ export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: 
     [commit],
   );
 
-  return { data, loaded, saveError, syncStatus, syncControls, saveMedication, deleteMedication, logDose, undoDose, replaceData };
+  /** The latest data, including what arrived since the last render. */
+  const getData = useCallback(() => dataRef.current, []);
+  const dismissLockError = useCallback(() => setLockError(null), []);
+
+  return {
+    data,
+    loaded,
+    access,
+    /** Being locked (the key forgotten here): this device's copy is being encrypted. */
+    locking: sealing,
+    lockError,
+    dismissLockError,
+    saveError,
+    syncStatus,
+    syncControls,
+    saveMedication,
+    deleteMedication,
+    logDose,
+    undoDose,
+    replaceData,
+    getData,
+  };
 }
 
 /** Per-device preferences that aren't part of the exported data. */

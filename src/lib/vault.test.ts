@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AppData, Medication } from '../../shared/types';
 import {
   MIN_PASSPHRASE_LENGTH,
@@ -315,15 +315,159 @@ describe('generatePassphrase', () => {
   });
 });
 
-describe('estimatePassphraseStrength', () => {
-  it('ranks obvious cases sensibly', () => {
-    expect(estimatePassphraseStrength('password123').score).toBe(0);
-    expect(estimatePassphraseStrength('aaaaaaaaaa').score).toBe(0);
-    expect(estimatePassphraseStrength('').score).toBe(0);
-    expect(estimatePassphraseStrength(generatePassphrase(6)).score).toBeGreaterThanOrEqual(3);
-    expect(estimatePassphraseStrength('Tr0ub4dor&3-xylophone!').score).toBeGreaterThanOrEqual(3);
-    const weak = estimatePassphraseStrength('abcdefghij');
-    expect(weak.score).toBeLessThanOrEqual(1);
-    expect(weak.label).toBeTruthy();
+describe('estimatePassphraseStrength (zxcvbn, loaded on demand)', () => {
+  const score = async (p: string) => (await estimatePassphraseStrength(p)).score;
+
+  it("uses the Very weak .. Very strong labels on zxcvbn's 0-4 scale", async () => {
+    expect(await estimatePassphraseStrength('')).toEqual({ score: 0, label: 'Very weak' });
+    expect(await estimatePassphraseStrength('password123')).toEqual({ score: 0, label: 'Very weak' });
+    expect(await estimatePassphraseStrength('able:acid:acorn:actor')).toEqual({ score: 1, label: 'Weak' });
+    expect(await estimatePassphraseStrength('Tr0ub4dor&3')).toEqual({ score: 2, label: 'Fair' });
+    expect(await estimatePassphraseStrength('correct horse battery staple')).toEqual({ score: 4, label: 'Very strong' });
+  });
+
+  it('ranks obvious cases sensibly', async () => {
+    expect(await score('password123')).toBe(0);
+    expect(await score('aaaaaaaaaa')).toBe(0);
+    expect(await score('')).toBe(0);
+    expect(await score('abcdefghij')).toBe(0);
+    expect(await score('13579')).toBe(0);
+    expect(await score(generatePassphrase(6))).toBeGreaterThanOrEqual(3);
+    expect(await score('Tr0ub4dor&3-xylophone!')).toBeGreaterThanOrEqual(3);
+  });
+
+  it('rates decorated, patterned and listed phrases at most Fair, most of them Weak or below', async () => {
+    const atMostFair = [
+      'P@ssw0rd!2024',
+      'Th1sIsMyP4ssw0rd',
+      'p4ssw0rd-p4$$w0rd-pa55word-p@ssword',
+      'Tr0ub4dor&3',
+      'dog1 dog2 dog3 dog4 dog5 dog6',
+      'test1 test2 test3 test4',
+      'welcome1 welcome2 welcome3 welcome4',
+      'tiger1-tiger2-tiger3-tiger4',
+      'apple apples applez applesauce',
+      'able:acid:acorn:actor',
+      'apple:banana:cherry:grape:lemon',
+      'apple—banana—cherry—grape',
+      'qwe asd zxc rty fgh vbn',
+      "asdfghjkl;'zxcvbnm",
+      '1q2w3e4r5t6y',
+      '1qaz2wsx3edc4rfv',
+      'a1b2c3d4e5f6g7h8',
+      'aAbBcCdDeEfF',
+      'the-the-the-the-the',
+      'pill-pill-pill-pill-pill',
+      'hello hello hello hello',
+      '13579-13579-13579-13579-13579',
+      'password123',
+    ];
+    let weakOrWorse = 0;
+    for (const p of atMostFair) {
+      const s = await score(p);
+      expect(s, p).toBeLessThanOrEqual(2);
+      if (s <= 1) weakOrWorse++;
+    }
+    expect(weakOrWorse).toBeGreaterThanOrEqual(Math.ceil(atMostFair.length * 0.8));
+  });
+
+  it('counts a token once however it is cased, leeted, counted or ended (the structure rules)', async () => {
+    // Without the rules zxcvbn rates each of these Very strong: it sees every piece as a fresh pick.
+    expect(await score('dog1 dog2 dog3 dog4 dog5 dog6')).toBe(0);
+    expect(await score('apple apples applez applesauce')).toBe(0);
+    expect(await score('p4ssw0rd-p4$$w0rd-pa55word-p@ssword')).toBe(0);
+    expect(await score('monkey-monkey-monkey-monkey-monkey-monkey')).toBe(await score('monkey'));
+    // Words in alphabetical order are a list. The same words not in order are fine.
+    expect(await score('able:acid:acorn:actor')).toBeLessThanOrEqual(1);
+    expect(await score('acorn:able:actor:acid')).toBeGreaterThanOrEqual(3);
+    // Two interleaved runs.
+    expect(await score('a1b2c3d4e5f6g7h8')).toBeLessThanOrEqual(1);
+  });
+
+  it('does not let a short unexplained string look strong (zxcvbn charges any such 10 characters like a secret)', async () => {
+    expect(await score('Tr0ub4dor&3')).toBeLessThanOrEqual(2);
+    expect(await score('xK9#mQ2$vL7!')).toBeGreaterThanOrEqual(3);
+  });
+
+  it('rates random 20-digit strings Fair or better, nearly always', async () => {
+    let atLeastFair = 0;
+    const N = 60;
+    for (let i = 0; i < N; i++) {
+      const digits = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(20)), (b) => b % 10).join('');
+      if ((await score(digits)) >= 2) atLeastFair++;
+    }
+    expect(atLeastFair / N).toBeGreaterThanOrEqual(0.95);
+  }, 60_000);
+
+  it('rates generated 6-word passphrases Strong or better, every time (large sample)', async () => {
+    for (let i = 0; i < 3_000; i++) {
+      const g = generatePassphrase(6);
+      expect(await score(g), g).toBeGreaterThanOrEqual(3);
+    }
+  }, 60_000);
+
+  it('rates a generated-shaped passphrase on zxcvbn alone, whatever chance did with it (the narrow exception)', async () => {
+    // Alphabetical order, a shared beginning, a repeated word: all possible by chance in a generated one.
+    for (const g of [
+      'able-acid-acorn-actor-adapt-adult',
+      'sun-sunny-star-start-stare-stone',
+      'night-win-win-giant-verse-throw',
+      'check-winter-jolly-brook-jolly-jolly',
+    ]) {
+      expect(await score(g), g).toBeGreaterThanOrEqual(3);
+    }
+    // Typed by hand with other separators, or with too few different words, it's an ordinary phrase.
+    expect(await score('able:acid:acorn:actor:adapt:adult')).toBeLessThanOrEqual(1);
+    expect(await score('able-able-able-able-able-able')).toBe(0);
+    expect(await score('able-acid-able-acid-able-acid')).toBeLessThanOrEqual(1);
+    // A generated passphrase always has at least 4 different words, even when few are asked for.
+    for (let i = 0; i < 500; i++) expect(new Set(generatePassphrase(4).split('-')).size).toBe(4);
+  });
+
+  it('still rates reasonable passphrases strong', async () => {
+    for (const p of [
+      'correct horse battery staple',
+      'zebra quartz ninja velvet tomato',
+      'purple-elephant-dances-quietly-1987',
+      'My cat Felix eats 3 tins of tuna daily!',
+      'Blue7!Kettle#Moss',
+      'xK9#mQ2$vL7!',
+    ]) {
+      expect(await score(p), p).toBeGreaterThanOrEqual(3);
+    }
+  });
+});
+
+describe('the strength checker loads on demand and never guesses', () => {
+  afterEach(() => {
+    vi.doUnmock('./strengthEngine');
+    vi.resetModules();
+  });
+
+  it('rates nothing before it has loaded, then rates', async () => {
+    vi.resetModules();
+    const v = await import('./vault');
+    expect(v.isStrengthCheckerLoaded()).toBe(false);
+    expect(v.rateLoadedPassphrase('correct horse battery staple')).toBeNull();
+    await v.loadStrengthChecker();
+    expect(v.isStrengthCheckerLoaded()).toBe(true);
+    expect(v.rateLoadedPassphrase('correct horse battery staple')!.score).toBeGreaterThanOrEqual(3);
+    expect(v.rateLoadedPassphrase('password123')!.score).toBe(0);
+  });
+
+  it('rejects (never resolves "fine") when the checker cannot be loaded, and loads on a later try', async () => {
+    vi.resetModules();
+    vi.doMock('./strengthEngine', () => {
+      throw new Error('Failed to fetch dynamically imported module');
+    });
+    const v = await import('./vault');
+    await expect(v.estimatePassphraseStrength('correct horse battery staple')).rejects.toThrow();
+    await expect(v.loadStrengthChecker()).rejects.toThrow();
+    expect(v.isStrengthCheckerLoaded()).toBe(false);
+    expect(v.rateLoadedPassphrase('correct horse battery staple')).toBeNull();
+    // Back online.
+    vi.doUnmock('./strengthEngine');
+    await v.loadStrengthChecker();
+    expect(v.rateLoadedPassphrase('correct horse battery staple')!.score).toBeGreaterThanOrEqual(3);
   });
 });

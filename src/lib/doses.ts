@@ -125,10 +125,11 @@ export function formatWhen(d: Date, now = new Date()): string {
 
 /** Days that `onHand` units last at the current schedule rate, or null if unknown. */
 export function supplyDaysLeft(med: Medication, onHand: number | undefined, now = new Date()): number | null {
-  if (typeof onHand !== 'number') return null;
+  if (typeof onHand !== 'number' || !Number.isFinite(onHand)) return null;
   const end = new Date(now);
   end.setDate(end.getDate() + 28);
   const per28 = occurrencesBetween(med.schedule, now, end).length * (med.quantityPerDose ?? 1);
-  if (!per28) return null;
+  if (!Number.isFinite(per28) || per28 <= 0) return null;
+  if (onHand <= 0) return 0;
   return Math.floor(onHand / (per28 / 28));
 }

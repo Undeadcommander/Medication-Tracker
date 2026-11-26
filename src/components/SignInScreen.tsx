@@ -27,10 +27,20 @@ function describeAttempt(): string | null {
 
 interface Props {
   onSignIn: (user: User) => void;
-  /** Error carried over from a redirect sign-in. */
-  initialError?: string | null;
+  /**
+   * An error from signing in (e.g. a redirect sign-in's, or one the app found afterwards). A new
+   * object each time, so the same message given again is shown again.
+   */
+  initialError?: { message: string } | null;
   /** Informational message, e.g. after deleting an account. */
   notice?: string | null;
+  /**
+   * The chosen account was deleted on this device and its old data is still being removed (perhaps
+   * by another tab, which can take up to a minute): the choice takes effect once that's done.
+   */
+  waiting?: User | null;
+  /** Give up waiting (and on that choice), to choose again. */
+  onCancelWaiting?: () => void;
 }
 
 function GoogleLogo() {
@@ -44,8 +54,8 @@ function GoogleLogo() {
   );
 }
 
-export function SignInScreen({ onSignIn, initialError = null, notice = null }: Props) {
-  const [error, setError] = useState<string | null>(initialError);
+export function SignInScreen({ onSignIn, initialError = null, notice = null, waiting = null, onCancelWaiting }: Props) {
+  const [error, setError] = useState<string | null>(initialError?.message ?? null);
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
   const [stalled, setStalled] = useState(false);
@@ -54,10 +64,42 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
   const attemptSeq = useRef(0);
   const onSignInRef = useRef(onSignIn);
   onSignInRef.current = onSignIn;
+  const googleBtn = useRef<HTMLButtonElement>(null);
+  const guestBtn = useRef<HTMLButtonElement>(null);
+  const waitingCancel = useRef<HTMLButtonElement>(null);
+  /** The button the latest choice was made with: focus goes back to it if that choice is given up. */
+  const origin = useRef<'google' | 'guest'>('google');
 
-  // A redirect sign-in's error arrives after this screen has mounted.
+  /**
+   * The Google sign-in of attempt `seq` has an account: hand it over, once (the popup's result and
+   * the account found on coming back can both arrive, and the screen may stay up, e.g. while an
+   * old copy of the account is removed). Later results of the same attempt are ignored.
+   */
+  const deliver = (seq: number, user: User) => {
+    if (seq !== attemptSeq.current) return;
+    attemptSeq.current++;
+    setBusy(false);
+    setAttempt(describeAttempt());
+    onSignInRef.current(user);
+  };
+
+  // Waiting for the chosen account's old data to be removed: the button used is disabled meanwhile,
+  // so focus moves to the waiting box's Cancel; once it's over (given up, or failed) and this
+  // screen is still up, back to that button.
+  const wasWaiting = useRef(false);
   useEffect(() => {
-    if (initialError) setError(initialError);
+    if (waiting) {
+      wasWaiting.current = true;
+      waitingCancel.current?.focus();
+    } else if (wasWaiting.current) {
+      wasWaiting.current = false;
+      (origin.current === 'guest' || !googleBtn.current ? guestBtn.current : googleBtn.current)?.focus();
+    }
+  }, [waiting]);
+
+  // A redirect sign-in's error (or the app's) arrives after this screen has mounted.
+  useEffect(() => {
+    if (initialError) setError(initialError.message);
     setAttempt(describeAttempt());
   }, [initialError]);
 
@@ -95,7 +137,7 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
       if (document.visibilityState !== 'visible') return;
       // Firebase may have the account already even though the popup call hasn't heard.
       void currentGoogleUser()
-        .then((u) => u && seq === attemptSeq.current && onSignInRef.current(u))
+        .then((u) => u && deliver(seq, u))
         .catch(() => {});
       stallIn(STALL_AFTER_RETURN_MS);
     };
@@ -114,6 +156,7 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
 
   const signIn = async () => {
     const seq = ++attemptSeq.current;
+    origin.current = 'google';
     setBusy(true);
     setStalled(false);
     setError(null);
@@ -122,7 +165,7 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
     preloadSync(); // fetch the sync code while the user is on Google's page
     try {
       const user = await pending;
-      if (user && seq === attemptSeq.current) onSignIn(user);
+      if (user) deliver(seq, user);
     } catch (e) {
       if (seq === attemptSeq.current) setError(e instanceof Error ? e.message : 'Sign-in failed');
     } finally {
@@ -154,7 +197,14 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
         )}
 
         {FIREBASE_CONFIGURED ? (
-          <button type="button" className="btn google-btn" onClick={signIn} disabled={busy || !ready} aria-busy={busy || !ready}>
+          <button
+            ref={googleBtn}
+            type="button"
+            className="btn google-btn"
+            onClick={signIn}
+            disabled={busy || !ready || Boolean(waiting)}
+            aria-busy={busy || !ready}
+          >
             {busy || !ready ? <span className="spinner" aria-hidden /> : <GoogleLogo />}
             {busy ? (stalled ? 'Still signing in…' : 'Signing in…') : ready ? 'Sign in with Google' : 'Loading…'}
           </button>
@@ -164,7 +214,7 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
           </div>
         )}
 
-        {busy && stalled && (
+        {busy && stalled && !waiting && (
           <div className="alert alert-warning signin-stalled" role="status">
             <p>
               This is taking longer than it should. If you've finished signing in with Google, reload Amendra to pick up
@@ -181,6 +231,21 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
           </div>
         )}
 
+        {waiting && (
+          <div className="alert alert-warning signin-stalled" role="status">
+            <p>
+              <span className="spinner" aria-hidden /> Removing this account's old data from this device before{' '}
+              {waiting.provider === 'guest' ? 'starting over' : 'signing in'}… If it's still being deleted in another tab, this
+              can take up to a minute.
+            </p>
+            <div className="signin-stalled-actions">
+              <button ref={waitingCancel} type="button" className="btn btn-sm btn-ghost" onClick={onCancelWaiting}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
         {error && (
           <div className="alert alert-error" role="alert">
             {error}
@@ -190,10 +255,19 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null }: P
         <div className="signin-divider">
           <span>or</span>
         </div>
-        <button type="button" className="btn btn-ghost" onClick={() => {
+        <button
+          ref={guestBtn}
+          type="button"
+          className="btn btn-ghost"
+          disabled={Boolean(waiting)}
+          onClick={() => {
             attemptSeq.current++; // a Google sign-in still pending mustn't replace this choice
+            origin.current = 'guest';
+            setBusy(false);
+            setError(null);
             onSignIn(GUEST_USER);
-          }}>
+          }}
+        >
           Continue without an account
         </button>
         <p className="signin-privacy muted">

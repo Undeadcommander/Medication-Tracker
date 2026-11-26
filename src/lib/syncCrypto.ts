@@ -28,10 +28,12 @@ export type SyncCryptoErrorCode =
   | 'corrupt'
   | 'unsupported'
   | 'weak-passphrase'
+  | 'strength-unavailable'
   | 'already-set-up'
   | 'changed-elsewhere'
   | 'offline'
-  | 'not-ready';
+  | 'not-ready'
+  | 'lock-failed';
 
 const MESSAGES: Record<SyncCryptoErrorCode, string> = {
   'wrong-passphrase': 'Wrong passphrase. Check it and try again.',
@@ -40,10 +42,13 @@ const MESSAGES: Record<SyncCryptoErrorCode, string> = {
   corrupt: "The account's encryption settings in the cloud are damaged and can't be read.",
   unsupported: 'This account was set up by a newer version of Amendra. Reload the app to update it.',
   'weak-passphrase': 'Choose a longer, harder-to-guess passphrase.',
+  'strength-unavailable': "The passphrase strength check couldn't be loaded, so the passphrase can't be accepted. Check your connection and try again.",
   'already-set-up': 'Encryption was just set up for this account on another device. Unlock with that passphrase instead.',
   'changed-elsewhere': 'The encryption settings were changed on another device at the same time. Please try again.',
   offline: "You're offline. Connect to the internet and try again.",
   'not-ready': "The account's encryption settings haven't loaded yet. Check your connection and try again.",
+  'lock-failed':
+    "Amendra couldn't encrypt this device's copy of your data, so the key wasn't forgotten and this device is still unlocked. Try again, or sign out instead.",
 };
 
 export class SyncCryptoError extends Error {
@@ -700,4 +705,47 @@ export async function decodeRemote(
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// This device's copy while locked
+// ---------------------------------------------------------------------------------------------
+//
+// When an encrypted account is locked on this device (its key forgotten, or the session ended
+// elsewhere), the device's own copy of its data is kept encrypted with the account key until it's
+// unlocked again: edits not uploaded yet aren't lost, and nothing is readable without the key.
+
+const localAad = (uid: string, keyId: string) => aad(uid, 'local', keyId);
+
+/** An account's local data, encrypted with its data key. */
+export interface SealedLocalCopy {
+  v: 1;
+  keyId: string;
+  iv: Uint8Array;
+  ct: ArrayBuffer;
+  gz: boolean;
+}
+
+export async function sealLocalCopy(dek: CryptoKey, uid: string, keyId: string, value: unknown): Promise<SealedLocalCopy> {
+  let payload = utf8(JSON.stringify(value));
+  const gz = typeof CompressionStream !== 'undefined';
+  if (gz) payload = await pipe(payload, new CompressionStream('gzip'));
+  const iv = randomBytes(IV_BYTES);
+  const ct = await subtle().encrypt({ name: 'AES-GCM', iv, additionalData: localAad(uid, keyId) }, dek, payload);
+  return { v: 1, keyId, iv, ct, gz };
+}
+
+/** Throws if it can't be opened with this key (wrong key, damaged). */
+export async function openLocalCopy(dek: CryptoKey, uid: string, sealed: SealedLocalCopy): Promise<unknown> {
+  if (sealed?.v !== 1 || !(sealed.iv instanceof Uint8Array) || !(sealed.ct instanceof ArrayBuffer)) throw new SyncCryptoError('corrupt');
+  const iv = bytes(sealed.iv.length);
+  iv.set(sealed.iv);
+  let data: Bytes = new Uint8Array(
+    await subtle().decrypt({ name: 'AES-GCM', iv, additionalData: localAad(uid, sealed.keyId) }, dek, sealed.ct),
+  );
+  if (sealed.gz) {
+    if (typeof DecompressionStream === 'undefined') throw new SyncCryptoError('unsupported');
+    data = await pipe(data, new DecompressionStream('gzip'));
+  }
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(data));
 }

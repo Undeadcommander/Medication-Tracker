@@ -104,6 +104,15 @@ function randomId(): string {
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+/** The device id, if one has been made (doesn't make one). */
+function storedDeviceId(): string | null {
+  try {
+    return localStorage.getItem(DEVICE_KEY) ?? memoryDeviceId;
+  } catch {
+    return memoryDeviceId;
+  }
+}
+
 /** Random per-device secret; doubles as the bearer credential for the push server. */
 export function getDeviceId(): string {
   try {
@@ -298,11 +307,18 @@ export async function enablePush(): Promise<PushState> {
   }
 }
 
-export async function disablePush(): Promise<void> {
+/** Stop the reminders this tab shows by itself (local mode and snoozes), e.g. signed out in another tab. */
+export function stopLocalReminders(): void {
   clearLocalTimers();
   for (const t of snoozeTimers) clearTimeout(t);
   snoozeTimers = [];
   lastReminders = [];
+}
+
+export async function disablePush(): Promise<void> {
+  // A reminder update under way would land after this and bring them back: let it finish first.
+  await syncChain;
+  stopLocalReminders();
   lastPostSig = '';
   try {
     const reg = await activeRegistration();
@@ -523,11 +539,15 @@ async function postReminders(reminders: PushReminder[], dismissed: string[]): Pr
   const capped = reminders.slice(0, MAX_SERVER_REMINDERS);
   const sig = `${capped.length}:${capped.map((r) => `${r.id}|${r.title}|${r.body}`).join(';')}:${dismissed.join(',')}`;
   if (sig === lastPostSig && Date.now() - lastPostAt < 30_000) return true;
+  // Nothing to remind about, and the server can't know this device (its id was forgotten on
+  // signing out): don't register it again just to send it an empty list.
+  if (!capped.length && !storedDeviceId()) return true;
 
   const deviceId = getDeviceId();
   const send = () =>
     fetchJson(api('push/reminders'), { method: 'POST', body: { deviceId, reminders: capped, dismissed } }, 20_000);
   let res = await send();
+  if (res.status === 404 && !capped.length) return true; // the server has nothing for it already
   if (res.status === 404) {
     // Server doesn't know this device (e.g. its db was reset): re-register the subscription and retry.
     // The server also drops devices whose subscription was rejected (expired or wrong VAPID key).
@@ -580,6 +600,10 @@ async function doSync(
 
   // Local fallback (permission granted, but no subscription or the server is unreachable).
   lastReminders = reminders;
+  if (!reminders.length) {
+    clearLocalTimers(); // nothing to show (e.g. signed out): no need to keep re-arming
+    return { count: 0, mode: 'local' };
+  }
   ensureLocalMaintenance();
   return { count: armLocalTimers(), mode: 'local' };
 }
@@ -706,6 +730,28 @@ export async function claimPendingTakes(match: (t: PendingTake) => boolean): Pro
     if (mine.length) writePending(list.filter((t) => !match(t)));
     return mine;
   });
+}
+
+/** Takes still waiting for a tracker to apply them. */
+export function pendingTakeCount(): number {
+  return readPending().length;
+}
+
+/**
+ * Signing out: forget what this device kept about the account's reminders (taps not applied yet,
+ * which reminders were shown) and the device id the push server knew it by. Call after disablePush().
+ */
+export function forgetReminderState(): void {
+  memoryPending = [];
+  shownLocally.clear();
+  memoryDeviceId = null;
+  try {
+    localStorage.removeItem(PENDING_KEY);
+    localStorage.removeItem(SHOWN_KEY);
+    localStorage.removeItem(DEVICE_KEY);
+  } catch {
+    /* storage unavailable */
+  }
 }
 
 /** Called when takes are queued, from this tab or another one. */

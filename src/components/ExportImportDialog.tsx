@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import type { AppData } from '../../shared/types';
 import {
   MIN_PASSPHRASE_LENGTH,
@@ -6,11 +6,11 @@ import {
   decryptVault,
   downloadVault,
   encryptVault,
-  estimatePassphraseStrength,
   generatePassphrase,
   readVaultFile,
 } from '../lib/vault';
 import { Modal } from './Modal';
+import { usePassphraseStrength } from './usePassphraseStrength';
 import './ExportImportDialog.css';
 
 interface ExportImportDialogProps {
@@ -73,7 +73,11 @@ export function ExportImportDialog({ data, onImport, onClose }: ExportImportDial
   const [confirmReplace, setConfirmReplace] = useState(false);
   const [imported, setImported] = useState<ImportMode | null>(null);
 
+  /** Bumped whenever the file or passphrase changes (or the dialog goes): a result for an older one is dropped. */
+  const decryptRun = useRef(0);
+
   const clearSecrets = useCallback(() => {
+    decryptRun.current += 1;
     setExpPass('');
     setExpConfirm('');
     setImpPass('');
@@ -90,16 +94,16 @@ export function ExportImportDialog({ data, onImport, onClose }: ExportImportDial
   }, [clearSecrets, onClose]);
 
   // ---- Export -------------------------------------------------------------------------------
-  const strength = useMemo(() => estimatePassphraseStrength(expPass), [expPass]);
-  const filledSegments = expPass ? Math.max(1, strength.score) : 0;
+  const { strength, checking: strengthChecking, failed: strengthFailed, retry: retryStrength } = usePassphraseStrength(expPass);
+  const filledSegments = strength ? Math.max(1, strength.score) : 0;
   const tooShort =expPass.length < MIN_PASSPHRASE_LENGTH;
   const mismatch = expConfirm.length > 0 && expPass !== expConfirm;
-  const canExport = !tooShort && expPass === expConfirm && strength.score >= 1 && !expBusy;
+  const canExport = !tooShort && expPass === expConfirm && strength !== null && strength.score >= 1 && !expBusy;
 
   let expProblem: string | null = null;
   if (expPass.length > 0 && tooShort) {
     expProblem = `Use at least ${MIN_PASSPHRASE_LENGTH} characters (${MIN_PASSPHRASE_LENGTH - expPass.length} more).`;
-  } else if (expPass.length > 0 && strength.score < 1) {
+  } else if (expPass.length > 0 && strength !== null && strength.score < 1) {
     expProblem = 'That passphrase is too easy to guess. Try a longer one or use the generator.';
   } else if (mismatch) {
     expProblem = 'The two passphrases do not match.';
@@ -144,6 +148,8 @@ export function ExportImportDialog({ data, onImport, onClose }: ExportImportDial
 
   // ---- Import -------------------------------------------------------------------------------
   const resetPreview = () => {
+    decryptRun.current += 1; // a decryption or file read under way no longer applies
+    setImpBusy(false);
     setPreview(null);
     setConfirmReplace(false);
     setImported(null);
@@ -155,27 +161,32 @@ export function ExportImportDialog({ data, onImport, onClose }: ExportImportDial
     setVaultJson(null);
     setFileName('');
     if (!file) return;
+    const run = decryptRun.current;
     try {
       const json = await readVaultFile(file);
+      if (run !== decryptRun.current) return; // another file (or passphrase) was chosen meanwhile
       setVaultJson(json);
       setFileName(file.name);
     } catch (err) {
-      setImpError(describeError(err));
+      if (run === decryptRun.current) setImpError(describeError(err));
     }
   };
 
   const submitDecrypt = async (e: FormEvent) => {
     e.preventDefault();
     if (vaultJson === null || impPass.length === 0 || impBusy) return;
-    setImpBusy(true);
     setImpError(null);
     resetPreview();
+    setImpBusy(true);
+    const run = decryptRun.current;
     try {
-      setPreview(await decryptVault(vaultJson, impPass));
+      const decrypted = await decryptVault(vaultJson, impPass);
+      // Not if the file or passphrase changed meanwhile: it's for the old ones.
+      if (run === decryptRun.current) setPreview(decrypted);
     } catch (err) {
-      setImpError(describeError(err));
+      if (run === decryptRun.current) setImpError(describeError(err));
     } finally {
-      setImpBusy(false);
+      if (run === decryptRun.current) setImpBusy(false);
     }
   };
 
@@ -372,13 +383,24 @@ export function ExportImportDialog({ data, onImport, onClose }: ExportImportDial
             </div>
 
             <div className="ei-meter-wrap" aria-live="polite">
-              <div className="ei-meter" data-score={expPass ? strength.score : -1} aria-hidden="true">
+              <div className="ei-meter" data-score={strength ? strength.score : -1} aria-hidden="true">
                 {[0, 1, 2, 3].map((i) => (
                   <span key={i} className={i < filledSegments ? 'on' : ''} />
                 ))}
               </div>
-              <span className="ei-meter-label">{expPass ? `Strength: ${strength.label}` : 'Strength: not set'}</span>
+              <span className="ei-meter-label">
+                {strengthChecking ? 'Checking strength…' : strength ? `Strength: ${strength.label}` : 'Strength: not set'}
+              </span>
             </div>
+
+            {strengthFailed && (
+              <div className="alert alert-error" role="alert">
+                Couldn't load the passphrase strength check (are you offline?). A passphrase can't be accepted without it.{' '}
+                <button type="button" className="btn btn-sm" onClick={retryStrength}>
+                  Retry
+                </button>
+              </div>
+            )}
 
             {expProblem && (
               <div className="alert alert-warning" role="status">

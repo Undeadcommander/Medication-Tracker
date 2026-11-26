@@ -427,6 +427,21 @@ function readCachedInfo(key: string): DrugInfo | null {
   }
 }
 
+/** Signing out: forget which medications were looked up on this device (searches and drug info). */
+export function clearDrugInfoCache(): void {
+  searchCache.clear();
+  try {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k?.startsWith(INFO_KEY_PREFIX)) keys.push(k);
+    }
+    keys.forEach((k) => localStorage.removeItem(k));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 function writeCachedInfo(key: string, info: DrugInfo) {
   try {
     // Cap cache size: evict expired, then oldest entries.
