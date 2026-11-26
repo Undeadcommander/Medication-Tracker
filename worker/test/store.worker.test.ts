@@ -1417,6 +1417,31 @@ describe('validation, grouping, group snooze, and payload size', () => {
     expect(await queued(id)).toEqual([]);
   });
 
+  it('stores reminders under their anchor dose id, whatever id or anchor the client sent', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const T1 = T0 + 60_000;
+    const T2 = T1 + 60_000;
+    const odd = { ...reminder('a', T1), id: `whatever@${T1 + 5}` };
+    const group = {
+      id: `zzz@1`,
+      medId: 'zzz',
+      at: T1 + 1, // before its doses, and not one of them
+      title: 'x',
+      body: 'y',
+      doses: [
+        { medId: 'b', at: T2 },
+        { medId: 'c', at: T2 + 60_000 },
+      ],
+    };
+    const res = await apiJson('push/reminders', { deviceId: id, reminders: [odd, group] });
+    expect(res.data).toEqual({ ok: true, count: 2 });
+    expect((await queued(id)).map((r) => [r.id, r.at])).toEqual([
+      [`a@${T1}`, T1],
+      [`b@${T2}`, T2],
+    ]);
+  });
+
   it('keeps a dose a sync added to the in-flight group row', async () => {
     const id = deviceId();
     await subscribe(id, await makeSubscriber());

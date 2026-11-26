@@ -532,17 +532,18 @@ export class PushStore extends DurableObject<Env> {
     const seen = new Set<string>();
     const next: ReminderRow[] = [];
     for (const r of parsed) {
+      // Row ids are always the anchor dose's id (what the app sends): "sent", "dismissed" and
+      // stripDelivered all work on dose ids, so a client's own id or anchor is not trusted.
       let out: ReminderRow | null;
       if (!r.doses) {
-        out = r.at <= now || sent.has(r.id) ? null : row(r.medId, r.at, r.id, null);
+        const id = doseId(r.medId, r.at);
+        out = r.at <= now || sent.has(id) ? null : row(r.medId, r.at, id, null);
       } else {
         // A group never re-notifies a dose already delivered (e.g. in an earlier, larger group):
         // those doses leave it, and what is left fires at its earliest remaining dose.
         const left = r.doses.filter((d) => d.at > now && !sent.has(doseId(d.medId, d.at)));
         const first = left[0];
-        if (!first) out = null;
-        else if (left.length === r.doses.length && r.at > now) out = row(r.medId, r.at, r.id, left);
-        else out = row(first.medId, first.at, doseId(first.medId, first.at), left);
+        out = first ? row(first.medId, first.at, doseId(first.medId, first.at), left) : null;
       }
       if (!out || seen.has(out.id)) continue;
       seen.add(out.id);
