@@ -143,3 +143,89 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   event.waitUntil(handleClick(event));
 });
+
+const IDB_NAME = 'dosely-sw';
+const IDB_STORE = 'kv';
+const DEVICE_ID_KEY = 'deviceId';
+
+function readDeviceId() {
+  const idb = typeof indexedDB !== 'undefined' ? indexedDB : self.indexedDB;
+  if (!idb) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      const req = idb.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames || !db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onerror = () => resolve(null);
+      req.onsuccess = () => {
+        const db = req.result;
+        const closeDb = () => {
+          if (db && typeof db.close === 'function') db.close();
+        };
+        try {
+          if (db.objectStoreNames && !db.objectStoreNames.contains(IDB_STORE)) {
+            closeDb();
+            resolve(null);
+            return;
+          }
+          const tx = db.transaction(IDB_STORE, 'readonly');
+          const getReq = tx.objectStore(IDB_STORE).get(DEVICE_ID_KEY);
+          getReq.onsuccess = () => {
+            closeDb();
+            resolve(typeof getReq.result === 'string' && getReq.result ? getReq.result : null);
+          };
+          getReq.onerror = () => {
+            closeDb();
+            resolve(null);
+          };
+        } catch {
+          closeDb();
+          resolve(null);
+        }
+      };
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+// Re-register when the browser rotates the push subscription in the background; otherwise the
+// reminder server would keep pushing to the dead endpoint and drop the device.
+async function onSubscriptionChange(event) {
+  if (!API) return;
+  try {
+    const deviceId = await readDeviceId();
+    if (!deviceId) return;
+
+    const pm = self.registration.pushManager;
+    let sub = (event && event.newSubscription) || (pm ? await pm.getSubscription() : null);
+    if (!sub) {
+      if (!pm) return;
+      const keyRes = await fetch(`${API}/push/public-key`);
+      if (!keyRes.ok) return;
+      const data = await keyRes.json();
+      const publicKey = data && data.publicKey;
+      if (typeof publicKey !== 'string' || !publicKey) return;
+      sub = await pm.subscribe({ userVisibleOnly: true, applicationServerKey: publicKey });
+    }
+    if (!sub) return;
+
+    await fetch(`${API}/push/subscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId, subscription: sub.toJSON() }),
+    });
+  } catch (err) {
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('pushsubscriptionchange failed', err);
+    }
+  }
+}
+
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(onSubscriptionChange(event));
+});

@@ -131,6 +131,81 @@ export function getDeviceId(): string {
   }
 }
 
+// ---------- what the push server knows ----------
+
+/**
+ * The subscription the push server last accepted for this device, as `deviceId|endpoint|p256dh|auth`.
+ * Browsers can rotate a subscription (new endpoint and keys, same VAPID key); the server must
+ * hear about it, or it keeps pushing to the old one and then drops the device.
+ */
+const REGISTERED_KEY = 'medtracker.pushRegistered';
+let memoryRegistered: string | null = null;
+
+function subscriptionSig(sub: PushSubscription): string {
+  const j = sub.toJSON();
+  return [getDeviceId(), j.endpoint ?? '', j.keys?.p256dh ?? '', j.keys?.auth ?? ''].join('|');
+}
+
+function readRegistered(): string | null {
+  try {
+    return localStorage.getItem(REGISTERED_KEY) ?? memoryRegistered;
+  } catch {
+    return memoryRegistered;
+  }
+}
+
+/** Records `sub` as registered with the server (null: nothing is). */
+function markRegistered(sub: PushSubscription | null): void {
+  const sig = sub ? subscriptionSig(sub) : null;
+  memoryRegistered = sig;
+  try {
+    if (sig) localStorage.setItem(REGISTERED_KEY, sig);
+    else localStorage.removeItem(REGISTERED_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+  void shareDeviceIdWithSw(sub ? getDeviceId() : null);
+}
+
+/**
+ * Gives the service worker the device id (in IndexedDB, which it can read), so it can register a
+ * subscription the browser rotates while the app is closed (public/sw.js, pushsubscriptionchange).
+ */
+async function shareDeviceIdWithSw(deviceId: string | null): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  try {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('dosely-sw', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('kv');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction('kv', 'readwrite');
+        if (deviceId) tx.objectStore('kv').put(deviceId, 'deviceId');
+        else tx.objectStore('kv').delete('deviceId');
+        tx.oncomplete = () => resolve();
+        tx.onerror = tx.onabort = () => reject(tx.error);
+      });
+    } finally {
+      db.close();
+    }
+  } catch {
+    /* the page registers a rotated subscription on its next sync anyway */
+  }
+}
+
+/** Sends `sub` to the server for this device; true when it was accepted. */
+async function registerSubscription(sub: PushSubscription): Promise<boolean> {
+  const res = await fetchJson(api('push/subscribe'), {
+    method: 'POST',
+    body: { deviceId: getDeviceId(), subscription: sub.toJSON() },
+  });
+  if (res.ok) markRegistered(sub);
+  return res.ok;
+}
+
 // ---------- helpers ----------
 
 async function fetchJson(
@@ -198,7 +273,8 @@ async function getServerKey(force = false): Promise<Uint8Array<ArrayBuffer> | nu
 
 /**
  * Make sure the browser's push subscription was created for the server's current VAPID key
- * (it changes if server/data is wiped). Re-subscribes and re-registers when it doesn't match.
+ * (it changes if server/data is wiped), and that the server has it. Re-subscribes and
+ * re-registers when the key doesn't match; re-registers when the browser rotated the subscription.
  * Returns the usable subscription (`registered` when it was just sent to the server), or null if
  * there isn't one.
  */
@@ -209,8 +285,15 @@ async function ensureCurrentSubscription(
   const sub = await reg.pushManager.getSubscription();
   if (!sub) return null;
   const key = await getServerKey(forceKey);
-  if (!key || sameKey(sub.options.applicationServerKey, key)) return { sub, registered: false };
+  if (!key) return { sub, registered: false };
+  if (sameKey(sub.options.applicationServerKey, key)) {
+    if (readRegistered() === subscriptionSig(sub)) return { sub, registered: false };
+    // New endpoint/keys (or not recorded yet, e.g. registered by an older version of the app).
+    // Not accepted (server down, rate-limited): carry on, and try again on the next sync.
+    return { sub, registered: await registerSubscription(sub).catch(() => false) };
+  }
   await sub.unsubscribe().catch(() => {});
+  markRegistered(null);
   let fresh: PushSubscription;
   try {
     fresh = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
@@ -219,12 +302,9 @@ async function ensureCurrentSubscription(
     console.warn('Could not re-subscribe after a server key change:', err);
     return null;
   }
-  const res = await fetchJson(api('push/subscribe'), {
-    method: 'POST',
-    body: { deviceId: getDeviceId(), subscription: fresh.toJSON() },
-  });
+  const ok = await registerSubscription(fresh);
   lastPostSig = '';
-  return res.ok ? { sub: fresh, registered: true } : null;
+  return ok ? { sub: fresh, registered: true } : null;
 }
 
 // ---------- service worker ----------
@@ -305,14 +385,11 @@ export async function enablePush(): Promise<PushState> {
     }
     sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: serverKey });
 
-    const res = await fetchJson(api('push/subscribe'), {
-      method: 'POST',
-      body: { deviceId: getDeviceId(), subscription: sub.toJSON() },
-    }).catch(() => null);
-    if (res?.ok) return 'subscribed';
+    if (await registerSubscription(sub).catch(() => false)) return 'subscribed';
     // The server didn't take it. Drop the subscription, or getPushState() would report push as on
     // while only local reminders work; Settings then offers "Retry push setup".
     await sub.unsubscribe().catch(() => {});
+    markRegistered(null);
     return 'granted';
   } catch (err) {
     console.warn('Push subscription failed, using local reminders:', err);
@@ -334,6 +411,7 @@ export async function disablePush(): Promise<void> {
   await syncChain;
   stopLocalReminders();
   lastPostSig = '';
+  markRegistered(null);
   try {
     const reg = await activeRegistration();
     const sub = await reg?.pushManager.getSubscription();
@@ -712,10 +790,7 @@ async function postReminders(reminders: PushReminder[], dismissed: string[]): Pr
     const reg = await activeRegistration();
     const cur = reg ? await ensureCurrentSubscription(reg, true) : null;
     if (!cur) return false;
-    if (!cur.registered) {
-      const re = await fetchJson(api('push/subscribe'), { method: 'POST', body: { deviceId, subscription: cur.sub.toJSON() } });
-      if (!re.ok) return false;
-    }
+    if (!cur.registered && !(await registerSubscription(cur.sub))) return false;
     res = await send();
   }
   if (res.ok) {
@@ -790,7 +865,8 @@ export async function sendTestNotification(): Promise<void> {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
     throw new Error('Notifications are not enabled for this device.');
   }
-  if ((await getPushState()) === 'subscribed') {
+  // No server in this build: a subscription left over from an earlier build can't be used.
+  if (PUSH_SERVER_CONFIGURED && (await getPushState()) === 'subscribed') {
     // Unreachable server (null): fall back to a local notification below.
     const res = await fetchJson(api('push/test'), { method: 'POST', body: { deviceId: getDeviceId() } }).catch(() => null);
     if (res?.ok) return;
@@ -800,6 +876,7 @@ export async function sendTestNotification(): Promise<void> {
       // subscription so Settings offers "Retry push setup", which registers a fresh one.
       const reg = await activeRegistration();
       await (await reg?.pushManager.getSubscription())?.unsubscribe().catch(() => {});
+      markRegistered(null);
       throw new Error('This device is no longer registered for push reminders. Tap "Retry push setup".');
     }
     if (res) throw new Error('The reminder server could not send a notification right now. Please try again later.');
@@ -914,13 +991,16 @@ export function forgetReminderState(): void {
   shownLocally.clear();
   lastLogged = new Set();
   memoryDeviceId = null;
+  memoryRegistered = null;
   try {
     localStorage.removeItem(PENDING_KEY);
     localStorage.removeItem(SHOWN_KEY);
     localStorage.removeItem(DEVICE_KEY);
+    localStorage.removeItem(REGISTERED_KEY);
   } catch {
     /* storage unavailable */
   }
+  void shareDeviceIdWithSw(null);
 }
 
 /** Called when takes are queued, from this tab or another one. */
