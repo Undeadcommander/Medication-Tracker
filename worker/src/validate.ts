@@ -9,8 +9,12 @@ export const MAX_ENDPOINT = 2048;
 export const MAX_DISMISSED = 500;
 /** server/index.ts accepts 2 MB of JSON (3000 reminders x ~500 bytes is about 1.5 MB). */
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
+/** Every other POST (subscribe, unsubscribe, snooze, test) is a few KB at most. */
+export const MAX_SMALL_BODY_BYTES = 64 * 1024;
+/** Body cap for a POST route: only the full reminder sync needs the large one. */
+export const bodyLimitFor = (path: string) => (path === '/api/push/reminders' ? MAX_BODY_BYTES : MAX_SMALL_BODY_BYTES);
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{22,128}$/;
-const REMINDER_ID_RE = /^[^\s\u0000-\u001f]{1,120}@\d{1,16}$/;
+const REMINDER_ID_RE = /^[^\s\u0000-\u001f\u007f]{1,120}@\d{1,16}$/;
 /** base64 or base64url (padded or not); the decoded key lengths are checked at subscribe. */
 const KEY_RE = /^[A-Za-z0-9_\-+/]+={0,2}$/;
 const MAX_KEY_CHARS = 128;
@@ -159,7 +163,19 @@ export function parseOriginList(raw: string | undefined): Set<string> {
   return new Set(
     (raw ?? '')
       .split(',')
-      .map((o) => o.trim().replace(/\/+$/, ''))
+      .map((o) => {
+        // Browsers send Origin lowercased and without a path, so compare canonical origins.
+        const entry = o.trim();
+        if (!entry) return '';
+        try {
+          const origin = new URL(entry).origin;
+          if (origin !== 'null') return origin;
+        } catch {
+          /* fall through */
+        }
+        console.warn(`[push] ignoring invalid ALLOWED_ORIGINS entry: ${entry}`);
+        return '';
+      })
       .filter(Boolean),
   );
 }

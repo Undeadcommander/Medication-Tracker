@@ -9,6 +9,7 @@ import {
   MAX_REMINDERS,
   asObject,
   bad,
+  bodyLimitFor,
   parseDeviceId,
   parseOriginList,
   parseReminder,
@@ -329,17 +330,18 @@ export class PushStore extends DurableObject<Env> {
       // Cloudflare sets CF-Connecting-IP on every request it receives (clients can't forge it).
       const ip = request.headers.get('CF-Connecting-IP');
       if (ip && !this.allowIp(ROUTE_CLASS[path], ip)) throw new HttpError(429, 'slow down');
+      const body = await readJson(request, bodyLimitFor(path));
       switch (path) {
         case '/api/push/subscribe':
-          return json(await this.subscribe(await readJson(request)));
+          return json(await this.subscribe(body));
         case '/api/push/unsubscribe':
-          return json(await this.unsubscribe(await readJson(request)));
+          return json(await this.unsubscribe(body));
         case '/api/push/reminders':
-          return json(await this.setReminders(await readJson(request)));
+          return json(await this.setReminders(body));
         case '/api/push/snooze':
-          return json(await this.snooze(await readJson(request)));
+          return json(await this.snooze(body));
         case '/api/push/test':
-          return json(await this.test(await readJson(request)));
+          return json(await this.test(body));
       }
     }
     return json({ error: 'not found' }, 404);

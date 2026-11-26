@@ -261,6 +261,22 @@ describe('HTTP API', () => {
     const big = await api('push/reminders', JSON.stringify({ pad: 'x'.repeat(2 * 1024 * 1024) }));
     expect(big.status).toBe(413);
     expect(await big.json()).toEqual({ error: 'payload too large' });
+    // Only the reminder sync gets the 2 MB cap; the other routes take a few KB.
+    const smallPad = JSON.stringify({ deviceId: deviceId(), pad: 'x'.repeat(100 * 1024) });
+    const bigSubscribe = await api('push/subscribe', smallPad);
+    expect(bigSubscribe.status).toBe(413);
+    // Without a Content-Length (streamed), the Durable Object enforces the same cap while reading.
+    const streamed = await runInDurableObject(stub(), (instance: PushStore) =>
+      instance.fetch(
+        new Request(`${BASE}/push/test`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: new Blob([smallPad]).stream(),
+          duplex: 'half',
+        } as RequestInit),
+      ),
+    );
+    expect(streamed.status).toBe(413);
     const id = deviceId();
     expect((await apiJson('push/reminders', { deviceId: id, reminders: [] })).status).toBe(404);
     // Unknown device wins over a bad item, so the client re-subscribes (same order as server/index.ts).
