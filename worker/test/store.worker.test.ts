@@ -187,7 +187,6 @@ describe('HTTP API', () => {
       });
     });
 
-    expect(await apiJson('push/public-key')).toEqual({ status: 503, data: { error: 'push not configured' } });
     const h = await apiJson('health');
     expect(h.status).toBe(503);
     expect(h.data).toMatchObject({
@@ -295,6 +294,34 @@ describe('HTTP API', () => {
     expect(
       (await apiJson('push/snooze', { deviceId: id, reminder: reminder('m1', T0), minutes: 121 })).data,
     ).toEqual({ error: 'minutes must be between 1 and 120' });
+  });
+
+  it('answers non-JSON bodies and the public key without a Durable Object request', async () => {
+    // Any call into the object would throw (and turn into a 500).
+    const noStore = { ...env, PUSH_STORE: { idFromName: () => { throw new Error('Durable Object used'); } } } as unknown as typeof env;
+    const call = (path: string, init: RequestInit = {}, e = noStore) => {
+      const headers = new Headers(init.headers);
+      headers.set('Origin', ORIGIN);
+      return worker.fetch(new Request(`${BASE}/${path}`, { ...init, headers }), e);
+    };
+    for (const init of <RequestInit[]>[
+      { method: 'POST', body: 'deviceId=x', headers: { 'Content-Type': 'text/plain' } },
+      { method: 'POST', body: '{"deviceId":"x"}' },
+      { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': '0' } },
+    ]) {
+      const res = await call('push/subscribe', init);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'body must be an object' });
+      expect(res.headers.get('Access-Control-Allow-Origin')).toBe(ORIGIN);
+    }
+    const key = await call('push/public-key');
+    expect(key.status).toBe(200);
+    expect(await key.json()).toEqual({ publicKey: env.VAPID_PUBLIC_KEY });
+    // Same validation as the object's: a bad secret means no key (and the cached result follows the secrets).
+    const bad = await call('push/public-key', {}, { ...noStore, VAPID_SUBJECT: 'mailto:' } as typeof env);
+    expect(bad.status).toBe(503);
+    expect(await bad.json()).toEqual({ error: 'push not configured' });
+    expect((await call('push/public-key')).status).toBe(200);
   });
 
   it('accepts only known push services as subscription endpoints', async () => {

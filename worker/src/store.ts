@@ -236,7 +236,7 @@ export class PushStore extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.extraOrigins = parseOriginList(env.EXTRA_PUSH_ORIGINS);
+    this.extraOrigins = parseOriginList(env.EXTRA_PUSH_ORIGINS, 'EXTRA_PUSH_ORIGINS');
     this.ensureSchema();
   }
 
@@ -320,11 +320,6 @@ export class PushStore extends DurableObject<Env> {
       return v.ok
         ? json({ ok: true, devices, push: 'ready', time })
         : json({ ok: false, devices, push: 'misconfigured', problem: v.problem, time }, 503);
-    }
-    if (method === 'GET' && path === '/api/push/public-key') {
-      const v = await this.vapid();
-      if (!v.ok) throw new HttpError(503, 'push not configured');
-      return json({ publicKey: v.signer.config.publicKey });
     }
     if (method === 'POST' && path in ROUTE_CLASS) {
       // Cloudflare sets CF-Connecting-IP on every request it receives (clients can't forge it).

@@ -159,7 +159,7 @@ export function parseReminder(v: unknown): PushReminder {
   return r;
 }
 
-export function parseOriginList(raw: string | undefined): Set<string> {
+export function parseOriginList(raw: string | undefined, name = 'ALLOWED_ORIGINS'): Set<string> {
   return new Set(
     (raw ?? '')
       .split(',')
@@ -173,20 +173,23 @@ export function parseOriginList(raw: string | undefined): Set<string> {
         } catch {
           /* fall through */
         }
-        console.warn(`[push] ignoring invalid ALLOWED_ORIGINS entry: ${entry}`);
+        console.warn(`[push] ignoring invalid ${name} entry: ${entry}`);
         return '';
       })
       .filter(Boolean),
   );
 }
 
+/** True when the request declares a JSON body (express.json() ignores any other type). */
+export const isJsonRequest = (req: Request) =>
+  (req.headers.get('Content-Type') ?? '').split(';')[0].trim().toLowerCase() === 'application/json';
+
 /** Reads a JSON body with the same 2 MB cap as express.json({ limit: '2mb' }). */
 export async function readJson(req: Request, limit = MAX_BODY_BYTES): Promise<unknown> {
   const declared = Number(req.headers.get('Content-Length'));
   if (Number.isFinite(declared) && declared > limit) throw new HttpError(413, 'payload too large');
-  const type = (req.headers.get('Content-Type') ?? '').split(';')[0].trim().toLowerCase();
   // express.json() leaves non-JSON bodies unparsed, which then fails "body must be an object".
-  if (type !== 'application/json') return undefined;
+  if (!isJsonRequest(req)) return undefined;
   if (!req.body) return undefined;
   const reader = req.body.getReader();
   const chunks: Uint8Array[] = [];
