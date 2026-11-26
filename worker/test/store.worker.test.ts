@@ -1483,3 +1483,30 @@ describe('alarm writes', () => {
     expect(spies.del).not.toHaveBeenCalled();
   });
 });
+
+describe('storage schema', () => {
+  it('rebuilds tables left by the first Worker version', async () => {
+    const cols = await runInDurableObject(stub(), (instance: PushStore, state) => {
+      const sql = state.storage.sql;
+      sql.exec('DROP TABLE reminders; DROP TABLE sent; DROP TABLE devices;');
+      sql.exec(`CREATE TABLE devices (device_id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL, expiration REAL, rev INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE reminders (device_id TEXT NOT NULL, id TEXT NOT NULL, med_id TEXT NOT NULL, at INTEGER NOT NULL,
+        title TEXT NOT NULL, body TEXT NOT NULL, snoozed INTEGER NOT NULL DEFAULT 0, orig_id TEXT, orig_at INTEGER,
+        due_at INTEGER NOT NULL, PRIMARY KEY (device_id, id)) WITHOUT ROWID;
+        CREATE TABLE sent (device_id TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (device_id, id)) WITHOUT ROWID;`);
+      sql.exec("INSERT INTO devices VALUES ('old', 'https://fcm.googleapis.com/x', 'k', 'a', NULL, 1, 0)");
+      instance.ensureSchema();
+      return {
+        reminders: sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('reminders')").toArray().map((c) => c.name),
+        devices: sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM devices').one().n,
+      };
+    });
+    expect(cols.reminders).toContain('doses');
+    expect(cols.reminders).not.toContain('title');
+    expect(cols.devices).toBe(0);
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    expect((await apiJson('push/reminders', { deviceId: id, reminders: [reminder('m', T0 + 60_000)] })).data).toEqual({ ok: true, count: 1 });
+  });
+});

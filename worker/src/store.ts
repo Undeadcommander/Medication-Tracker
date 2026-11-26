@@ -234,6 +234,22 @@ export class PushStore extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.extraOrigins = parseOriginList(env.EXTRA_PUSH_ORIGINS);
+    this.ensureSchema();
+  }
+
+  /**
+   * Creates the tables. Tables from the first version of this Worker (no `doses` / `created_at`
+   * columns) are rebuilt: their devices simply re-register (the client re-subscribes on a 404).
+   */
+  ensureSchema(): void {
+    const columns = (table: string) =>
+      new Set(this.sql.exec<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((c) => c.name));
+    const reminderCols = columns('reminders');
+    const deviceCols = columns('devices');
+    if ((reminderCols.size && !reminderCols.has('doses')) || (deviceCols.size && !deviceCols.has('created_at'))) {
+      console.warn('[push] old storage schema found; rebuilding (devices will re-register).');
+      this.sql.exec('DROP TABLE IF EXISTS reminders; DROP TABLE IF EXISTS sent; DROP TABLE IF EXISTS devices;');
+    }
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS devices (
         device_id TEXT PRIMARY KEY,
