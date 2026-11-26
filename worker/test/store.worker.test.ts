@@ -1,6 +1,7 @@
 import { SELF, env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import worker, { storeStub } from '../src/index';
+import worker from '../src/index';
+import { storeStub } from '../src/stub';
 import { BATCH_SIZE, RETRY_MS, STALE_MS, type PushStore } from '../src/store';
 import { b64urlDecode, b64urlEncode } from '../src/webpush';
 

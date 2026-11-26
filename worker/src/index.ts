@@ -1,17 +1,13 @@
 // Dosely reminder server for Cloudflare Workers: the same /api routes as server/index.ts.
 // The Worker handles CORS and security headers; one Durable Object (PushStore) does the rest.
 import { PushStore, type Env } from './store';
+import { storeStub } from './stub';
 import { parseOriginList } from './validate';
 
+// workerd only accepts handlers and classes as named exports of the entry module, so helpers
+// (storeStub, constants) live in other modules.
 export { PushStore };
 export type { Env };
-
-/** All devices live in one Durable Object: this app has one user and a handful of devices. */
-export const STORE_NAME = 'global';
-
-export function storeStub(env: Env) {
-  return env.PUSH_STORE.get(env.PUSH_STORE.idFromName(STORE_NAME));
-}
 
 function withHeaders(res: Response, cors: Record<string, string>): Response {
   const out = new Response(res.body, res);
