@@ -721,6 +721,12 @@
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 14px;
 }
+/* Grid items default to min-width: auto, so one wide native control would stretch its column
+   past the screen edge. */
+.form-grid > *,
+.sched-dates > * {
+  min-width: 0;
+}
 .lookup-status {
   min-height: 1.3em;
   font-size: 0.85rem;
@@ -849,7 +855,10 @@
   gap: 6px;
 }
 .weekday {
+  min-width: 0;
   min-height: 42px;
+  /* Seven to a row leaves ~29px each at 320px: the browser's default side padding won't fit. */
+  padding: 0;
   border: 1.5px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface);
