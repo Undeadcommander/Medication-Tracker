@@ -242,9 +242,10 @@ export class PushStore extends DurableObject<Env> {
         ? body.dismissed.filter((x): x is string => typeof x === 'string').slice(0, MAX_DISMISSED)
         : [],
     );
-    // Validate everything before touching storage (a bad item rejects the whole request).
-    const parsed = body.reminders.map(parseReminder);
+    // Same order as server/index.ts: an unknown device is a 404 (the client re-subscribes on it)
+    // before any item is validated; a bad item then rejects the whole request untouched.
     this.requireDevice(deviceId);
+    const parsed = body.reminders.map(parseReminder);
     const now = Date.now();
     const sent = new Set(
       this.sql

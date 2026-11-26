@@ -203,6 +203,8 @@ describe('HTTP API', () => {
     expect(await big.json()).toEqual({ error: 'payload too large' });
     const id = deviceId();
     expect((await apiJson('push/reminders', { deviceId: id, reminders: [] })).status).toBe(404);
+    // Unknown device wins over a bad item, so the client re-subscribes (same order as server/index.ts).
+    expect((await apiJson('push/reminders', { deviceId: id, reminders: [{ id: 'x' }] })).status).toBe(404);
     expect((await apiJson('push/reminders', { deviceId: id, reminders: 'x' })).data).toEqual({
       error: 'reminders must be an array',
     });
