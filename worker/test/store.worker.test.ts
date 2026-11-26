@@ -1322,6 +1322,84 @@ describe('validation, grouping, group snooze, and payload size', () => {
     expect(sent).toHaveLength(1);
   });
 
+  /** Runs `during` once, from inside the first push request, before the push service answers. */
+  function duringFirstPush(during: () => Promise<unknown>) {
+    let ran = false;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = new Request(input as RequestInfo, init);
+      sent.push({ url: req.url, headers: req.headers, body: new Uint8Array(await req.arrayBuffer()) });
+      if (!ran) {
+        ran = true;
+        await during();
+      }
+      return new Response(null, { status: 201 });
+    });
+  }
+
+  it('does not send a reminder that a sync removed while an earlier push was in flight', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const T1 = T0 + 60_000;
+    await apiJson('push/reminders', { deviceId: id, reminders: [reminder('a', T1), reminder('b', T1 + 1)] });
+    // The app logs both doses during the first push: the next sync has neither.
+    duringFirstPush(() => apiJson('push/reminders', { deviceId: id, reminders: [] }));
+    setNow(T1 + 1);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    expect(await queued(id)).toEqual([]);
+  });
+
+  it('keeps a dose a sync added to the in-flight group row', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const T1 = T0 + 60_000;
+    const group = (doses: Array<[string, number]>) => ({
+      id: `a@${T1}`,
+      medId: 'a',
+      at: T1,
+      title: 'x',
+      body: 'y',
+      doses: doses.map(([medId, at]) => ({ medId, at })),
+    });
+    await apiJson('push/reminders', { deviceId: id, reminders: [group([['a', T1], ['b', T1 + 60_000]])] });
+    // A new medication's dose joins the same group (same id) while the push is in flight.
+    duringFirstPush(() =>
+      apiJson('push/reminders', { deviceId: id, reminders: [group([['a', T1], ['b', T1 + 60_000], ['c', T1 + 120_000]])] }),
+    );
+    setNow(T1);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    expect((await queued(id)).map((r) => r.id)).toEqual([`c@${T1 + 120_000}`]);
+  });
+
+  it('a re-subscribe during a push sends the rest, and the in-flight one again, to the new subscription', async () => {
+    const id = deviceId();
+    const old = await makeSubscriber();
+    await subscribe(id, old);
+    const T1 = T0 + 60_000;
+    await apiJson('push/reminders', { deviceId: id, reminders: [reminder('a', T1), reminder('b', T1 + 1)] });
+    const fresh = await makeSubscriber('https://web.push.apple.com/rotated');
+    duringFirstPush(() => subscribe(id, fresh));
+    setNow(T1 + 1);
+    await fireAlarm();
+    // Nothing more went to the old endpoint, and the reminder it took is kept for the new one.
+    expect(sent.map((s) => s.url)).toEqual([old.endpoint]);
+    expect((await queued(id)).map((r) => r.id)).toEqual([`a@${T1}`, `b@${T1 + 1}`]);
+    expect(await alarmTime()).toBe(T1 + 1);
+
+    await fireAlarm();
+    expect(sent.map((s) => s.url)).toEqual([old.endpoint, fresh.endpoint, fresh.endpoint]);
+    expect(await queued(id)).toEqual([]);
+    // Delivered to the current subscription: recorded as sent, so a late sync can't re-queue them.
+    const sentIds = await runInDurableObject(stub(), (_i, state) =>
+      state.storage.sql
+        .exec<{ id: string }>('SELECT id FROM sent WHERE device_id = ? ORDER BY id', id)
+        .toArray()
+        .map((r) => r.id),
+    );
+    expect(sentIds).toEqual([`a@${T1}`, `b@${T1 + 1}`]);
+  });
+
   it('group snooze: fires as group, shrinks when one dose is dismissed, and drops when both dismissed', async () => {
     const id = deviceId();
     const sub = await makeSubscriber();

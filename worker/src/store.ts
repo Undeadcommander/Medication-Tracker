@@ -824,19 +824,41 @@ export class PushStore extends DurableObject<Env> {
     }
     let attempts = 0;
     let lastOk: number | null = null;
-    for (const r of rows) {
+    for (const snap of rows) {
       if (used + attempts >= cap) break; // the rest stay due; the next run drops them
+      // `rows` is a snapshot, and every push is awaited: a request (or this loop's own
+      // stripDelivered) may have changed things since. Unsubscribed or re-subscribed: stop, and the
+      // next run sends what is left to the current subscription.
+      if (this.deviceRev(deviceId) !== d.rev) break;
+      // Send the reminder as it is stored now; skip it if it was removed (e.g. dismissed, or already
+      // delivered in another row) or rescheduled.
+      const cur = this.sql
+        .exec<ReminderRow & { due_at: number; tries: number }>(
+          'SELECT device_id, id, med_id, at, doses, snoozed, orig_id, orig_at, due_at, tries FROM reminders WHERE device_id = ? AND id = ?',
+          deviceId,
+          snap.id,
+        )
+        .toArray()[0];
+      if (!cur || cur.due_at > now) continue;
+      const r: DueRow = { ...snap, ...cur };
       attempts++;
       const target = { endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } };
       const result = await this.push(signer, deviceId, target, payloadFor(deviceId, r));
       // The device may have re-subscribed or unsubscribed while we awaited the push service.
-      const sameDevice = this.deviceRev(deviceId) === r.rev;
+      if (this.deviceRev(deviceId) !== d.rev) {
+        // Unsubscribed: its rows are gone already. Re-subscribed (its queue is kept): whatever the
+        // result, leave this reminder queued for the new subscription. The old one may no longer
+        // reach the device, and for a medication reminder a rare duplicate (same tag, so it
+        // replaces the first notification) is better than a missed dose.
+        break;
+      }
       if (result === 'ok') {
         lastOk = Date.now();
+        const delivered = membersOf(r);
         this.ctx.storage.transactionSync(() => {
-          this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, r.id);
-          if (!sameDevice) return;
-          const delivered = membersOf(r);
+          // stripDelivered removes a non-snoozed row itself (or keeps, regrouped, any dose a sync
+          // added to it in the meantime); a snoozed copy is removed here.
+          if (r.snoozed) this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, r.id);
           for (const m of delivered) {
             this.sql.exec('INSERT OR REPLACE INTO sent (device_id, id, at) VALUES (?, ?, ?)', deviceId, m.id, lastOk);
           }
@@ -845,11 +867,11 @@ export class PushStore extends DurableObject<Env> {
           this.stripDelivered(deviceId, delivered);
         });
       } else if (result === 'gone') {
-        if (sameDevice) this.dropDevice(deviceId);
+        this.dropDevice(deviceId);
         return attempts; // skip the device's other reminders
       } else if (result === 'drop') {
         this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, r.id);
-      } else if (sameDevice) {
+      } else {
         // Kept and retried with backoff until it goes stale (server/index.ts retried every 20 s).
         this.sql.exec(
           'UPDATE reminders SET due_at = ?, tries = tries + 1 WHERE device_id = ? AND id = ? AND due_at <= ?',
