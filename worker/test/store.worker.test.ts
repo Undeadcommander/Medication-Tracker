@@ -1103,6 +1103,47 @@ describe('eviction, heartbeat, concurrency, fairness, daily cap', () => {
     expect(sent).toHaveLength(BATCH_SIZE);
   });
 
+  it('fairness: ranks each device first, then prefers proven devices over unproven on equal rank', async () => {
+    const idP = 'dev_proven_00000000000000000';
+    const subP = await makeSubscriber('https://fcm.googleapis.com/fcm/send/fair-proven');
+    await subscribe(idP, subP);
+
+    // Deliver one reminder so idP is proven (last_ok IS NOT NULL).
+    const T = T0 + 10_000;
+    await apiJson('push/reminders', { deviceId: idP, reminders: [reminder('seed', T)] });
+    setNow(T);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    sent = [];
+
+    // Queue 2 due reminders on proven idP (later due_at) and 1 each on BATCH_SIZE unproven devices (earlier due_at).
+    const T2 = T + 10_000;
+    await apiJson('push/reminders', {
+      deviceId: idP,
+      reminders: [reminder('p0', T2 + 100), reminder('p1', T2 + 200)],
+    });
+    const unproven = await Promise.all(
+      Array.from({ length: BATCH_SIZE }, async (_, i) => {
+        const id = `dev_unproven_${String(i).padStart(2, '0')}_000000000`;
+        const sub = await makeSubscriber(`https://fcm.googleapis.com/fcm/send/fair-u-${i}`);
+        await subscribe(id, sub);
+        await apiJson('push/reminders', { deviceId: id, reminders: [reminder(`u${i}`, T2)] });
+        return { id, sub };
+      }),
+    );
+
+    setNow(T2 + 200);
+    await fireAlarm();
+    expect(sent).toHaveLength(BATCH_SIZE);
+    // Proven idP gets rank 0 ahead of unproven rank 0 (despite later due_at), but not rank 1 ahead of unproven rank 0.
+    expect(sent.filter((s) => s.url === subP.endpoint)).toHaveLength(1);
+    // All but the last unproven device (tiebroken by device_id) are served in run 1.
+    for (const u of unproven.slice(0, BATCH_SIZE - 1)) {
+      expect(sent.map((s) => s.url)).toContain(u.sub.endpoint);
+    }
+    expect(sent.map((s) => s.url)).not.toContain(unproven[BATCH_SIZE - 1].sub.endpoint);
+  });
+
   it(`caps unproven devices at DAILY_PUSHES_UNPROVEN (${DAILY_PUSHES_UNPROVEN}) attempts per UTC day and drops remaining due reminders`, async () => {
     const id = deviceId();
     await subscribe(id, await makeSubscriber());

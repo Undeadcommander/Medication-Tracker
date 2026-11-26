@@ -755,26 +755,18 @@ export class PushStore extends DurableObject<Env> {
       )
       .toArray();
     if (head.length <= BATCH_SIZE) return head;
-    const ranked: Array<{ row: DueRow; rank: number }> = [];
-    for (const { device_id } of this.sql.exec<{ device_id: string }>('SELECT device_id FROM devices').toArray()) {
-      const rows = this.sql
-        .exec<DueRow>(
-          `SELECT ${DUE_COLUMNS} FROM reminders r JOIN devices d ON d.device_id = r.device_id
-           WHERE r.device_id = ? AND r.due_at <= ? ORDER BY r.due_at LIMIT ?`,
-          device_id,
-          now,
-          BATCH_SIZE,
-        )
-        .toArray();
-      rows.forEach((row, rank) => ranked.push({ row, rank }));
-    }
-    ranked.sort(
-      (a, b) =>
-        a.rank - b.rank ||
-        Number(b.row.last_ok !== null) - Number(a.row.last_ok !== null) ||
-        a.row.due_at - b.row.due_at,
-    );
-    return ranked.slice(0, BATCH_SIZE).map((x) => x.row);
+    return this.sql
+      .exec<DueRow>(
+        `SELECT * FROM (
+           SELECT ${DUE_COLUMNS}, ROW_NUMBER() OVER (PARTITION BY r.device_id ORDER BY r.due_at, r.id) - 1 AS rn
+           FROM reminders r JOIN devices d ON d.device_id = r.device_id
+           WHERE r.due_at <= ?
+         ) WHERE rn < ? ORDER BY rn, (last_ok IS NOT NULL) DESC, due_at, device_id, id LIMIT ?`,
+        now,
+        BATCH_SIZE,
+        BATCH_SIZE,
+      )
+      .toArray();
   }
 
   /**
