@@ -11,6 +11,8 @@
     "bindings": [{ "name": "PUSH_STORE", "class_name": "PushStore" }]
   },
   // SQLite-backed Durable Objects are the ones the free plan allows.
+  // No Workers Rate Limiting binding is used (docs don't state free-plan availability and it is
+  // per-location); per-IP and per-device limits are enforced inside PushStore.
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PushStore"] }],
   // Watchdog: re-arms the Durable Object's alarm if it is ever lost. Alarms do the real timing.
   "triggers": { "crons": ["* * * * *"] },
@@ -20,7 +22,9 @@
     // Dev/test only: extra push-endpoint origins (e.g. a mock push service). Keep empty in production.
     "EXTRA_PUSH_ORIGINS": ""
   },
-  // Secrets (set with `npx wrangler secret put <NAME>`, never committed):
-  //   VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
+  // Required secrets (all three required, no fallback; set with `npx wrangler secret put <NAME>`,
+  // or in `worker/.dev.vars` for local dev — never committed):
+  //   VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT (mailto: or https: on a real dotted domain;
+  //   recommended: https://undeadcommander.github.io/Medication-Tracker/)
   "observability": { "enabled": true }
 }

@@ -6,8 +6,9 @@
 //  - 'local': permission is granted but there is no push subscription (or the server is down);
 //             the page schedules notifications itself with setTimeout. Only works while the app
 //             is open / not suspended.
-import type { DoseLog, Medication, PushReminder } from '../../shared/types';
+import type { DoseLog, Medication, PushDose, PushReminder } from '../../shared/types';
 import { occurrencesBetween } from '../../shared/schedule';
+import { GROUP_WINDOW_MS, MAX_GROUP_DOSES, doseId, reminderText } from '../../shared/reminderText';
 
 export type PushState = 'unsupported' | 'ios-needs-install' | 'denied' | 'default' | 'granted' | 'subscribed';
 
@@ -18,9 +19,8 @@ export interface PlatformInfo {
   supportsPush: boolean;
 }
 
+/** Reminder text is always discreet (shared/reminderText.ts): it never names a medication. */
 export interface SyncOptions {
-  /** Generic text ("Time for your medication"), no drug name or dose details. */
-  discreet?: boolean;
   horizonDays?: number;
 }
 
@@ -65,12 +65,12 @@ const LOCAL_REARM_MS = 3_600_000;
 const LOCAL_CATCHUP_MS = 2 * 3_600_000;
 /** Resume events (visibility, pageshow, focus) often arrive together: handle them once. */
 const RESUME_COALESCE_MS = 1000;
-const DISCREET_TITLE = 'Time for your medication';
-const DISCREET_BODY = 'Open Dosely to review your dose.';
 const NOTIFICATION_ACTIONS = [
   { action: 'take', title: 'Mark as taken' },
   { action: 'snooze', title: 'Snooze 10 min' },
 ];
+/** Grouped reminders: no "Mark as taken" (which doses?); snooze applies to the whole group. */
+const GROUP_ACTIONS = [{ action: 'snooze', title: 'Snooze 10 min' }];
 
 // ---------- platform ----------
 
@@ -318,6 +318,7 @@ export function stopLocalReminders(): void {
   for (const t of snoozeTimers) clearTimeout(t);
   snoozeTimers = [];
   lastReminders = [];
+  lastMissed = [];
 }
 
 export async function disablePush(): Promise<void> {
@@ -341,28 +342,47 @@ export async function disablePush(): Promise<void> {
 
 // ---------- building reminders ----------
 
-function pluralForm(form: string, qty: number): string {
-  return qty === 1 || /s$/i.test(form) ? form : `${form}s`;
+/** The doses a reminder covers: its group, or just itself. */
+function dosesOf(r: PushReminder): PushDose[] {
+  return r.doses?.length ? r.doses : [{ medId: r.medId, at: r.at }];
 }
 
-function reminderBody(med: Medication): string {
-  const parts: string[] = [];
-  if (med.dosage?.trim()) parts.push(med.dosage.trim());
-  const form = med.form?.trim();
-  const qty = med.quantityPerDose;
-  if (qty && form) parts.push(`${qty} ${pluralForm(form, qty)}`);
-  else if (qty) parts.push(`${qty} ${qty === 1 ? 'unit' : 'units'}`);
-  else if (form) parts.push(form);
-  if (med.instructions?.trim()) parts.push(med.instructions.trim());
-  const body = parts.join(' · ');
-  return body.length > 280 ? `${body.slice(0, 277)}…` : body;
+/**
+ * A reminder for `doses` (sorted, non-empty): one dose keeps the plain `${medId}@${at}` shape;
+ * two or more become a group anchored at the earliest. Text is always discreet.
+ */
+function reminderFor(doses: PushDose[]): PushReminder {
+  const [first] = doses;
+  const r: PushReminder = { id: doseId(first.medId, first.at), medId: first.medId, at: first.at, ...reminderText(doses.length) };
+  if (doses.length > 1) r.doses = doses.map((d) => ({ medId: d.medId, at: d.at }));
+  return r;
+}
+
+const byTime = (a: PushDose, b: PushDose) => a.at - b.at || (a.medId < b.medId ? -1 : a.medId > b.medId ? 1 : 0);
+
+/**
+ * Groups doses into notifications: a group starts at the earliest dose not yet grouped and takes
+ * every dose due up to GROUP_WINDOW_MS after it (anchored, not chained), at most MAX_GROUP_DOSES.
+ * It fires at its earliest dose. Exported for tests.
+ */
+export function groupDoses(doses: PushDose[]): PushReminder[] {
+  const sorted = [...doses].sort(byTime);
+  const out: PushReminder[] = [];
+  for (let i = 0; i < sorted.length; ) {
+    const anchor = sorted[i];
+    let j = i + 1;
+    while (j < sorted.length && j - i < MAX_GROUP_DOSES && sorted[j].at - anchor.at <= GROUP_WINDOW_MS) j++;
+    out.push(reminderFor(sorted.slice(i, j)));
+    i = j;
+  }
+  return out;
 }
 
 function buildReminders(
   meds: Medication[],
   doseLogs: DoseLog[],
   opts: SyncOptions,
-): { reminders: PushReminder[]; missed: PushReminder[]; dismissed: string[] } {
+): { reminders: PushReminder[]; missed: PushDose[]; dismissed: string[]; logged: Set<string> } {
   const now = Date.now();
   const horizon = Math.max(1, Math.min(opts.horizonDays ?? 30, 365));
   const from = new Date(now);
@@ -379,22 +399,23 @@ function buildReminders(
     if (iso.length === 24 && iso.charCodeAt(23) === 90 /* 'Z' */ && iso < cutoffIso) continue;
     const ms = Date.parse(log.scheduledFor);
     if (Number.isNaN(ms)) continue;
-    const id = `${log.medId}@${ms}`;
+    const id = doseId(log.medId, ms);
     logged.add(id);
-    // Handled recently: lets the server cancel any pending snooze for it.
+    // Handled recently: lets the server cancel any pending snooze for it (or drop it from a group).
     if (now - ms < 12 * 3_600_000 && ms < now + 3_600_000) dismissed.push(id);
   }
 
-  const reminders: PushReminder[] = [];
+  // A dose this device already showed (e.g. in a group, before one of its doses was logged and the
+  // groups were worked out again) is never scheduled again, here or on the push server.
+  const shown = shownKeys();
+  const upcoming: PushDose[] = [];
   // Recently due, still unlogged: local mode only (the push server never gets past reminders).
   // At most one per medication, the most recent, so reopening after several misses doesn't spam.
-  const missed: PushReminder[] = [];
+  const missed: PushDose[] = [];
   const catchupStart = now - LOCAL_CATCHUP_MS;
   for (const med of meds) {
     if (!med.notificationsEnabled) continue;
-    const title = opts.discreet ? DISCREET_TITLE : `Time to take ${med.name}`;
-    const body = opts.discreet ? DISCREET_BODY : reminderBody(med);
-    let latestMissed: PushReminder | null = null;
+    let latestMissed: PushDose | null = null;
     // Don't catch up on doses due before the med was added, its schedule changed, or its reminders
     // were turned on: the user may already have taken them, and an alert then is just noise.
     let catchupFrom = catchupStart;
@@ -404,59 +425,82 @@ function buildReminders(
     }
     for (const occ of occurrencesBetween(med.schedule, new Date(Math.min(catchupFrom, now)), to)) {
       const at = occ.getTime();
-      const id = `${med.id}@${at}`;
+      const id = doseId(med.id, at);
       if (logged.has(id)) continue;
-      const r = { id, medId: med.id, at, title, body };
       if (at < from.getTime()) {
-        if (!latestMissed || at > latestMissed.at) latestMissed = r;
-      } else reminders.push(r);
+        if (!latestMissed || at > latestMissed.at) latestMissed = { medId: med.id, at };
+      } else if (!shown.has(id)) upcoming.push({ medId: med.id, at });
     }
     if (latestMissed) missed.push(latestMissed);
   }
-  reminders.sort((a, b) => a.at - b.at);
-  missed.sort((a, b) => a.at - b.at);
-  return { reminders, missed, dismissed: dismissed.slice(-500) };
+  missed.sort(byTime);
+  return { reminders: groupDoses(upcoming), missed, dismissed: dismissed.slice(-500), logged };
 }
 
 // ---------- local fallback scheduler ----------
 
 let localTimers: ReturnType<typeof setTimeout>[] = [];
+/** Upcoming reminders (grouped), and recently missed doses to catch up on (local mode). */
 let lastReminders: PushReminder[] = [];
+let lastMissed: PushDose[] = [];
+/** Doses logged as of the last sync: a snoozed reminder re-shows only the ones still open. */
+let lastLogged = new Set<string>();
 let localActive = false;
 let rearmInterval: ReturnType<typeof setInterval> | null = null;
-/** Reminder keys this tab has shown, with when (pruned, so a long-open tab doesn't grow it forever). */
+/** Keys this tab has shown (dose ids, or a snooze's own key), with when (pruned). */
 const shownLocally = new Map<string, number>();
 /** Shared by all open tabs: each one arms its own local timers, but only one should alert. */
 const SHOWN_KEY = 'medtracker.shownReminders';
 const SHOWN_TTL_MS = 2 * 86_400_000;
 const SHOWN_LOCK = 'medtracker-local-reminder';
 
-/** Claims `key` for this tab. False if this tab or another open tab already showed it. */
-function claimShown(key: string): boolean {
+function readSharedShown(now: number): Record<string, number> {
+  const raw = JSON.parse(localStorage.getItem(SHOWN_KEY) ?? '{}') as Record<string, unknown>;
+  const shared: Record<string, number> = {};
+  for (const [k, t] of Object.entries(raw ?? {})) if (typeof t === 'number' && now - t <= SHOWN_TTL_MS) shared[k] = t;
+  return shared;
+}
+
+/** Everything shown recently, by this tab or another (read only). */
+function shownKeys(): Set<string> {
+  const now = Date.now();
+  const keys = new Set<string>();
+  for (const [k, t] of shownLocally) if (now - t <= SHOWN_TTL_MS) keys.add(k);
+  try {
+    for (const k of Object.keys(readSharedShown(now))) keys.add(k);
+  } catch {
+    /* storage unavailable */
+  }
+  return keys;
+}
+
+/**
+ * Claims `keys` for this tab and returns the ones nobody (this tab or another open tab) had
+ * claimed yet. A group notification claims each of its doses, so no dose is shown twice.
+ */
+function claimShown(keys: string[]): string[] {
   const now = Date.now();
   for (const [k, t] of shownLocally) if (now - t > SHOWN_TTL_MS) shownLocally.delete(k);
-  if (shownLocally.has(key)) return false;
-  shownLocally.set(key, now);
+  let fresh = keys.filter((k) => !shownLocally.has(k));
   try {
-    const raw = JSON.parse(localStorage.getItem(SHOWN_KEY) ?? '{}') as Record<string, unknown>;
-    const shared: Record<string, number> = {};
-    for (const [k, t] of Object.entries(raw ?? {})) if (typeof t === 'number' && now - t <= SHOWN_TTL_MS) shared[k] = t;
-    if (key in shared) return false;
-    shared[key] = now;
-    localStorage.setItem(SHOWN_KEY, JSON.stringify(shared));
+    const shared = readSharedShown(now);
+    fresh = fresh.filter((k) => !(k in shared));
+    for (const k of fresh) shared[k] = now;
+    if (fresh.length) localStorage.setItem(SHOWN_KEY, JSON.stringify(shared));
   } catch {
     /* storage unavailable: dedupe within this tab only */
   }
-  return true;
+  for (const k of fresh) shownLocally.set(k, now);
+  return fresh;
 }
 
-/** Undo a claim whose notification could not be shown. */
-function releaseShownNow(key: string): void {
-  shownLocally.delete(key);
+/** Undo claims whose notification could not be shown. */
+function releaseShownNow(keys: string[]): void {
+  for (const k of keys) shownLocally.delete(k);
   try {
     const raw = JSON.parse(localStorage.getItem(SHOWN_KEY) ?? '{}') as Record<string, unknown>;
-    if (raw && typeof raw === 'object' && key in raw) {
-      delete raw[key];
+    if (raw && typeof raw === 'object' && keys.some((k) => k in raw)) {
+      for (const k of keys) delete raw[k];
       localStorage.setItem(SHOWN_KEY, JSON.stringify(raw));
     }
   } catch {
@@ -465,18 +509,18 @@ function releaseShownNow(key: string): void {
 }
 
 /** Same lock as claiming, so a release can't race another tab's read-modify-write of SHOWN_KEY. */
-async function releaseShown(key: string): Promise<void> {
-  const release = async () => releaseShownNow(key);
+async function releaseShown(keys: string[]): Promise<void> {
+  const release = async () => releaseShownNow(keys);
   try {
     if (typeof navigator !== 'undefined' && navigator.locks) await navigator.locks.request(SHOWN_LOCK, release);
-    else releaseShownNow(key);
+    else releaseShownNow(keys);
   } catch {
-    releaseShownNow(key);
+    releaseShownNow(keys);
   }
 }
 
-async function claimShownAcrossTabs(key: string): Promise<boolean> {
-  const claim = async () => claimShown(key);
+async function claimShownAcrossTabs(keys: string[]): Promise<string[]> {
+  const claim = async () => claimShown(keys);
   try {
     // Serialise the read-check-write across tabs whose timers fire at the same moment.
     return typeof navigator !== 'undefined' && navigator.locks ? await navigator.locks.request(SHOWN_LOCK, claim) : claim();
@@ -491,46 +535,66 @@ function clearLocalTimers(): void {
   localActive = false;
 }
 
+/** Same `data` shape as the push server's payload (public/sw.js reads it). */
 function notificationData(r: PushReminder) {
-  return {
+  const data: Record<string, unknown> = {
     medId: r.medId,
     scheduledFor: new Date(r.at).toISOString(),
     reminderId: r.id,
     deviceId: getDeviceId(),
     reminder: r,
   };
+  if (r.doses) data.count = r.doses.length;
+  return data;
 }
 
 /** Keys with a showLocal still in progress (e.g. waiting on the registration), so repeated re-arms don't pile up. */
 const showingLocally = new Set<string>();
 
-/** `key` dedupes; the notification itself always describes the original dose `r`. */
-async function showLocal(r: PushReminder, key = r.id): Promise<void> {
-  if (showingLocally.has(key)) return;
-  showingLocally.add(key);
-  let claimed = false;
+/**
+ * Shows `r` once. Normally each of its doses is claimed, and only doses not shown before are
+ * included (none left: nothing is shown). A snooze passes its own `snoozeKey` instead, so the
+ * same doses can be shown again; doses logged since are left out.
+ */
+async function showLocal(r: PushReminder, snoozeKey?: string): Promise<void> {
+  const busyKey = snoozeKey ?? r.id;
+  if (showingLocally.has(busyKey)) return;
+  showingLocally.add(busyKey);
+  let claimed: string[] = [];
   try {
     // Check we can deliver before claiming, so a reminder isn't burned when we can't show it.
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
     const reg = await activeRegistration();
     if (!reg) return;
-    if (!(await claimShownAcrossTabs(key))) return;
-    claimed = true;
-    await reg.showNotification(r.title, {
-      body: r.body,
-      tag: r.id,
-      data: notificationData(r),
+    let doses = dosesOf(r);
+    if (snoozeKey) {
+      doses = doses.filter((d) => !lastLogged.has(doseId(d.medId, d.at)));
+      if (!doses.length) return;
+      claimed = await claimShownAcrossTabs([snoozeKey]);
+      if (!claimed.length) return;
+    } else {
+      claimed = await claimShownAcrossTabs(doses.map((d) => doseId(d.medId, d.at)));
+      const fresh = new Set(claimed);
+      doses = doses.filter((d) => fresh.has(doseId(d.medId, d.at)));
+      if (!doses.length) return;
+    }
+    const shown = reminderFor(doses);
+    await reg.showNotification(shown.title, {
+      body: shown.body,
+      tag: shown.id,
+      data: notificationData(shown),
       icon: ICON,
       badge: ICON,
       renotify: true,
       requireInteraction: true,
-      actions: NOTIFICATION_ACTIONS,
+      // A group can't be marked as taken from the notification: the user should see which doses.
+      actions: shown.doses ? GROUP_ACTIONS : NOTIFICATION_ACTIONS,
     } as NotificationOptions);
   } catch (err) {
     console.warn('Local notification failed:', err);
-    if (claimed) await releaseShown(key); // let a later re-arm retry
+    if (claimed.length) await releaseShown(claimed); // let a later re-arm retry
   } finally {
-    showingLocally.delete(key);
+    showingLocally.delete(busyKey);
   }
 }
 
@@ -540,15 +604,22 @@ function armLocalTimers(): number {
   localTimers = [];
   const now = Date.now();
   let armed = 0;
-  // Overdue but recent: catch up on the latest one per medication (earlier ones are skipped).
-  const catchup = new Map<string, PushReminder>();
-  for (const r of lastReminders) {
-    if (r.at <= now && now - r.at <= LOCAL_CATCHUP_MS) {
-      const prev = catchup.get(r.medId);
-      if (!prev || r.at > prev.at) catchup.set(r.medId, r);
-    }
+  // Overdue but recent: catch up in one notification, on the latest dose per medication (earlier
+  // ones are skipped), leaving out doses already shown.
+  const latest = new Map<string, PushDose>();
+  // A late group brings all its doses, including ones due a few minutes from now (no timer is
+  // armed for them: the group's time has passed).
+  const overdue = [
+    ...lastMissed.filter((d) => now - d.at <= LOCAL_CATCHUP_MS),
+    ...lastReminders.filter((r) => r.at <= now && now - r.at <= LOCAL_CATCHUP_MS).flatMap(dosesOf),
+  ];
+  for (const d of overdue) {
+    const prev = latest.get(d.medId);
+    if (!prev || d.at > prev.at) latest.set(d.medId, d);
   }
-  for (const r of catchup.values()) void showLocal(r);
+  const shown = shownKeys();
+  const catchup = [...latest.values()].filter((d) => !shown.has(doseId(d.medId, d.at))).sort(byTime);
+  if (catchup.length) void showLocal(reminderFor(catchup.slice(0, MAX_GROUP_DOSES)));
   for (const r of lastReminders) {
     const delay = r.at - now;
     if (delay > LOCAL_WINDOW_MS) break; // sorted ascending
@@ -592,11 +663,17 @@ function listenForLocalSnooze(): void {
     const d = event.data as { type?: string; reminder?: PushReminder; minutes?: number } | null;
     if (d?.type !== 'snooze-local' || !d.reminder || typeof d.reminder.id !== 'string') return;
     const r = d.reminder;
+    if (typeof r.medId !== 'string' || typeof r.at !== 'number') return;
+    // Only the dose fields matter (the text is rebuilt); ignore anything malformed in `doses`.
+    const doses = (Array.isArray(r.doses) ? r.doses : []).filter(
+      (x): x is PushDose => !!x && typeof x.medId === 'string' && typeof x.at === 'number',
+    );
+    const snoozed = reminderFor(doses.length ? doses.sort(byTime) : [{ medId: r.medId, at: r.at }]);
     const minutes = Math.min(120, Math.max(1, Number(d.minutes) || 10));
-    const key = `${r.id}#snooze@${Date.now()}`;
+    const key = `${snoozed.id}#snooze@${Date.now()}`;
     const timer = setTimeout(() => {
       snoozeTimers = snoozeTimers.filter((t) => t !== timer);
-      void showLocal(r, key);
+      void showLocal(snoozed, key);
     }, minutes * 60_000);
     snoozeTimers.push(timer);
   });
@@ -610,7 +687,7 @@ let lastPostAt = 0;
 
 async function postReminders(reminders: PushReminder[], dismissed: string[]): Promise<boolean> {
   const capped = reminders.slice(0, MAX_SERVER_REMINDERS);
-  const sig = `${capped.length}:${capped.map((r) => `${r.id}|${r.title}|${r.body}`).join(';')}:${dismissed.join(',')}`;
+  const sig = `${capped.length}:${capped.map((r) => `${r.id}|${dosesOf(r).map((d) => doseId(d.medId, d.at)).join('+')}`).join(';')}:${dismissed.join(',')}`;
   if (sig === lastPostSig && Date.now() - lastPostAt < 30_000) return true;
   // Nothing to remind about, and the server can't know this device (its id was forgotten on
   // signing out): don't register it again just to send it an empty list.
@@ -652,10 +729,12 @@ async function doSync(
   if (state !== 'subscribed' && state !== 'granted') {
     clearLocalTimers();
     lastReminders = [];
+    lastMissed = [];
     return { count: 0, mode: 'off' };
   }
 
-  const { reminders, missed, dismissed } = buildReminders(meds, doseLogs, opts);
+  const { reminders, missed, dismissed, logged } = buildReminders(meds, doseLogs, opts);
+  lastLogged = logged;
 
   if (state === 'subscribed') {
     try {
@@ -664,6 +743,7 @@ async function doSync(
       if (sub && (await postReminders(reminders, dismissed))) {
         clearLocalTimers();
         lastReminders = [];
+        lastMissed = [];
         return { count: Math.min(reminders.length, MAX_SERVER_REMINDERS), mode: 'push' };
       }
     } catch (err) {
@@ -672,8 +752,9 @@ async function doSync(
   }
 
   // Local fallback (permission granted, but no subscription or the server is unreachable).
-  lastReminders = [...missed, ...reminders];
-  if (!lastReminders.length) {
+  lastReminders = reminders;
+  lastMissed = missed;
+  if (!lastReminders.length && !lastMissed.length) {
     clearLocalTimers(); // nothing to show (e.g. signed out): no need to keep re-arming
     return { count: 0, mode: 'local' };
   }
@@ -817,6 +898,7 @@ export function pendingTakeCount(): number {
 export function forgetReminderState(): void {
   memoryPending = [];
   shownLocally.clear();
+  lastLogged = new Set();
   memoryDeviceId = null;
   try {
     localStorage.removeItem(PENDING_KEY);

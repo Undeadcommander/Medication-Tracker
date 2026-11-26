@@ -1,5 +1,6 @@
 // Request validation, ported from server/index.ts (same limits and error messages).
-import type { PushReminder } from '../../shared/types';
+import { MAX_GROUP_DOSES, doseId } from '../../shared/reminderText';
+import type { PushDose, PushReminder } from '../../shared/types';
 
 export const MAX_REMINDERS = 3000;
 export const MAX_TITLE = 120;
@@ -10,7 +11,12 @@ export const MAX_DISMISSED = 500;
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{22,128}$/;
 const REMINDER_ID_RE = /^[^\s\u0000-\u001f]{1,120}@\d{1,16}$/;
-const KEY_RE = /^[A-Za-z0-9_\-+/=]{8,256}$/;
+/** base64 or base64url (padded or not); the decoded key lengths are checked at subscribe. */
+const KEY_RE = /^[A-Za-z0-9_\-+/]+={0,2}$/;
+const MAX_KEY_CHARS = 128;
+/** Unpaired UTF-16 surrogates (not valid text; JSON.stringify escapes them to 6 bytes each). */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 export class HttpError extends Error {
   constructor(
@@ -80,7 +86,8 @@ export function parseSubscription(v: unknown, extraOrigins: ReadonlySet<string> 
   }
   const keys = asObject(o.keys, 'subscription.keys');
   const { p256dh, auth } = keys;
-  if (typeof p256dh !== 'string' || !KEY_RE.test(p256dh) || typeof auth !== 'string' || !KEY_RE.test(auth)) {
+  const keyOk = (k: unknown): k is string => typeof k === 'string' && k.length <= MAX_KEY_CHARS && KEY_RE.test(k);
+  if (!keyOk(p256dh) || !keyOk(auth)) {
     return bad('invalid subscription keys');
   }
   const exp = o.expirationTime;
@@ -91,21 +98,61 @@ export function parseSubscription(v: unknown, extraOrigins: ReadonlySet<string> 
   };
 }
 
+/**
+ * Cuts `s` to at most `max` UTF-16 units without splitting a surrogate pair, after replacing
+ * unpaired surrogates (so the result is always well-formed text).
+ */
+export function clipText(s: string, max: number): string {
+  const clean = s.replace(new RegExp(LONE_SURROGATE_RE.source, 'g'), '\uFFFD');
+  if (clean.length <= max) return clean;
+  const code = clean.charCodeAt(max - 1);
+  return clean.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
+}
+
+function parseMedId(v: unknown): string {
+  if (typeof v !== 'string' || v.length < 1 || v.length > 100 || CONTROL_RE.test(v) || LONE_SURROGATE_RE.test(v)) {
+    return bad('invalid medId');
+  }
+  return v;
+}
+
+function parseTime(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > 8.64e15) return bad('invalid reminder time');
+  return Math.round(v);
+}
+
+/** A group's doses: 2..MAX_GROUP_DOSES distinct doses, sorted, none before the reminder's time. */
+function parseDoses(v: unknown, at: number): PushDose[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v) || v.length < 1 || v.length > MAX_GROUP_DOSES) return bad('invalid reminder doses');
+  const seen = new Set<string>();
+  const doses = v.map((d): PushDose => {
+    const o = asObject(d, 'dose');
+    const dose = { medId: parseMedId(o.medId), at: parseTime(o.at) };
+    const id = doseId(dose.medId, dose.at);
+    if (dose.at < at || seen.has(id)) bad('invalid reminder doses');
+    seen.add(id);
+    return dose;
+  });
+  doses.sort((a, b) => a.at - b.at || (a.medId < b.medId ? -1 : a.medId > b.medId ? 1 : 0));
+  // A one-dose "group" is just that dose.
+  return doses.length >= 2 ? doses : undefined;
+}
+
 export function parseReminder(v: unknown): PushReminder {
   const o = asObject(v, 'reminder');
-  const { id, medId, at, title, body } = o;
-  if (typeof id !== 'string' || !REMINDER_ID_RE.test(id)) return bad('invalid reminder id');
-  if (typeof medId !== 'string' || medId.length < 1 || medId.length > 100) return bad('invalid medId');
-  if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0 || at > 8.64e15) return bad('invalid reminder time');
+  const { id, medId, title, body } = o;
+  if (typeof id !== 'string' || !REMINDER_ID_RE.test(id) || LONE_SURROGATE_RE.test(id)) return bad('invalid reminder id');
+  const med = parseMedId(medId);
+  const at = parseTime(o.at);
   if (typeof title !== 'string' || !title.trim()) return bad('invalid reminder title');
   if (typeof body !== 'string') return bad('invalid reminder body');
-  return {
-    id,
-    medId,
-    at: Math.round(at),
-    title: title.slice(0, MAX_TITLE),
-    body: body.slice(0, MAX_BODY),
-  };
+  const doses = parseDoses(o.doses, at);
+  // Title and body are checked for compatibility but never stored or sent: notifications use the
+  // server's own discreet wording (shared/reminderText.ts).
+  const r: PushReminder = { id, medId: med, at, title: clipText(title, MAX_TITLE), body: clipText(body, MAX_BODY) };
+  if (doses) r.doses = doses;
+  return r;
 }
 
 export function parseOriginList(raw: string | undefined): Set<string> {

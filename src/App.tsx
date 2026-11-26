@@ -45,7 +45,7 @@ import {
   resumeAccount,
   whenSignOutEnds,
 } from './lib/session';
-import { loadPrefs, savePrefs, useAppData } from './lib/store';
+import { useAppData } from './lib/store';
 import { encryptionMarker } from './lib/sync';
 import { mergeAppData } from './lib/vault';
 
@@ -453,7 +453,6 @@ function Tracker({
     setAfterUnlock(null);
     setDialog(afterUnlock.next ? { kind: 'encryption', view: afterUnlock.next } : null);
   }, [afterUnlock, busyDialog]);
-  const [prefs, setPrefs] = useState(loadPrefs);
   const [lastSync, setLastSync] = useState<{ count: number; mode: 'push' | 'local' | 'off' } | null>(null);
   const [needsNotifSetup, setNeedsNotifSetup] = useState(false);
   const [syncTick, setSyncTick] = useState(0);
@@ -510,20 +509,20 @@ function Tracker({
     return onPendingTakesChange(drain);
   }, [loaded, data.medications]);
 
-  // Keep scheduled reminders in sync with medications, logs and preferences.
+  // Keep scheduled reminders in sync with medications and logs.
   // Not before the data has loaded: an empty list would clear this device's reminders.
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(() => {
-      syncReminders(data.medications, data.doseLogs, { discreet: prefs.discreetNotifications })
+      syncReminders(data.medications, data.doseLogs)
         .then(setLastSync)
         .catch(() => setLastSync(null));
     }, 800);
     return () => clearTimeout(t);
-  }, [loaded, data.medications, data.doseLogs, prefs.discreetNotifications, syncTick]);
+  }, [loaded, data.medications, data.doseLogs, syncTick]);
 
   // Signed out or switched account: stop this account's reminders (here and on the push server),
-  // so its medication names don't keep appearing in notifications.
+  // so its doses don't keep prompting notifications.
   useEffect(() => () => void syncReminders([], []).catch(() => {}), []);
 
   // Encrypted sync was never set up for this account: suggest it once per session. (A locked
@@ -909,12 +908,6 @@ function Tracker({
           )}
           {dialog?.kind === 'notifications' && (
             <NotificationSettings
-              discreet={prefs.discreetNotifications}
-              onDiscreetChange={(v) => {
-                const next = { ...prefs, discreetNotifications: v };
-                setPrefs(next);
-                savePrefs(next);
-              }}
               enabledMedCount={notifMeds}
               lastSync={lastSync}
               onStateChange={() => setSyncTick((n) => n + 1)}

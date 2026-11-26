@@ -11,8 +11,6 @@ import {
 import { Modal } from './Modal';
 
 interface Props {
-  discreet: boolean;
-  onDiscreetChange: (v: boolean) => void;
   enabledMedCount: number;
   lastSync: { count: number; mode: 'push' | 'local' | 'off' } | null;
   onStateChange: () => void;
@@ -28,7 +26,7 @@ const STATE_TEXT: Record<PushState, string> = {
   subscribed: 'Push notifications are on. Reminders arrive even when Dosely is closed.',
 };
 
-export function NotificationSettings({ discreet, onDiscreetChange, enabledMedCount, lastSync, onStateChange, onClose }: Props) {
+export function NotificationSettings({ enabledMedCount, lastSync, onStateChange, onClose }: Props) {
   const [state, setState] = useState<PushState | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
@@ -127,16 +125,9 @@ export function NotificationSettings({ discreet, onDiscreetChange, enabledMedCou
           </div>
         )}
 
-        <label className="switch-row">
-          <input type="checkbox" role="switch" checked={discreet} onChange={(e) => onDiscreetChange(e.target.checked)} />
-          <span>
-            <strong>Discreet notifications</strong>
-            <span className="field-hint" style={{ display: 'block' }}>
-              Show "Time for your medication" without the medication name. The name is then never sent to the reminder
-              server or shown on your lock screen.
-            </span>
-          </span>
-        </label>
+        <p className="muted notif-summary">
+          Reminders never show medication names: they say "Time for your medication" (or how many are due).
+        </p>
 
         <p className="muted notif-summary">
           {enabledMedCount} medication{enabledMedCount === 1 ? '' : 's'} with reminders on.

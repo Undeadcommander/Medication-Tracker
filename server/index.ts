@@ -5,7 +5,8 @@ import * as webpush from 'web-push';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { PushReminder } from '../shared/types';
+import { MAX_GROUP_DOSES, doseId, reminderText } from '../shared/reminderText';
+import type { PushDose, PushReminder } from '../shared/types';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_DIR = path.join(ROOT, 'server', 'data');
@@ -51,8 +52,6 @@ if (!/^(mailto:[^\s@]+@[^\s@]+|https:\/\/\S+)$/.test(VAPID_SUBJECT)) {
 
 // ---------- limits ----------
 const MAX_REMINDERS = 3000;
-const MAX_TITLE = 120;
-const MAX_BODY = 300;
 const MAX_ENDPOINT = 2048;
 const STALE_MS = 15 * 60_000;
 const TICK_MS = 20_000;
@@ -219,21 +218,44 @@ function parseSubscription(v: unknown): StoredSubscription {
   };
 }
 
+function parseMedId(v: unknown): string {
+  if (typeof v !== 'string' || v.length < 1 || v.length > 100) return bad('invalid medId');
+  return v;
+}
+
+function parseTime(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > 8.64e15) return bad('invalid reminder time');
+  return Math.round(v);
+}
+
+function parseDoses(v: unknown, at: number): PushDose[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v) || v.length < 1 || v.length > MAX_GROUP_DOSES) return bad('invalid reminder doses');
+  const seen = new Set<string>();
+  const doses = v.map((d): PushDose => {
+    const o = asObject(d, 'dose');
+    const dose = { medId: parseMedId(o.medId), at: parseTime(o.at) };
+    const id = doseId(dose.medId, dose.at);
+    if (dose.at < at || seen.has(id)) bad('invalid reminder doses');
+    seen.add(id);
+    return dose;
+  });
+  doses.sort((a, b) => a.at - b.at || (a.medId < b.medId ? -1 : a.medId > b.medId ? 1 : 0));
+  return doses.length >= 2 ? doses : undefined;
+}
+
 function parseReminder(v: unknown): PushReminder {
   const o = asObject(v, 'reminder');
-  const { id, medId, at, title, body } = o;
+  const { id, title, body } = o;
   if (typeof id !== 'string' || !REMINDER_ID_RE.test(id)) return bad('invalid reminder id');
-  if (typeof medId !== 'string' || medId.length < 1 || medId.length > 100) return bad('invalid medId');
-  if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0 || at > 8.64e15) return bad('invalid reminder time');
+  const medId = parseMedId(o.medId);
+  const at = parseTime(o.at);
   if (typeof title !== 'string' || !title.trim()) return bad('invalid reminder title');
   if (typeof body !== 'string') return bad('invalid reminder body');
-  return {
-    id,
-    medId,
-    at: Math.round(at),
-    title: title.slice(0, MAX_TITLE),
-    body: body.slice(0, MAX_BODY),
-  };
+  const doses = parseDoses(o.doses, at);
+  const r: PushReminder = { id, medId, at, ...reminderText(doses ? doses.length : 1) };
+  if (doses) r.doses = doses;
+  return r;
 }
 
 function getDevice(deviceId: string): DeviceRecord {
@@ -244,15 +266,39 @@ function getDevice(deviceId: string): DeviceRecord {
 
 // ---------- delivery ----------
 function payloadFor(deviceId: string, r: StoredReminder) {
-  const origId = r.origId ?? r.id;
-  const origAt = r.origAt ?? r.at;
-  const reminder: PushReminder = { id: origId, medId: r.medId, at: origAt, title: r.title, body: r.body };
+  const tag = r.origId ?? r.id;
+  if (!r.doses || r.doses.length < 2) {
+    const text = reminderText(1);
+    const origAt = r.origAt ?? r.at;
+    const reminder: PushReminder = { id: tag, medId: r.medId, at: origAt, ...text };
+    return {
+      ...text,
+      tag,
+      data: { medId: r.medId, scheduledFor: new Date(origAt).toISOString(), reminderId: tag, deviceId, reminder },
+    };
+  }
+  const count = r.doses.length;
+  const text = reminderText(count);
+  const anchor = r.doses[0];
+  const reminder: PushReminder = { id: tag, medId: anchor.medId, at: anchor.at, ...text, doses: r.doses };
   return {
-    title: r.title,
-    body: r.body,
-    tag: origId,
-    data: { medId: r.medId, scheduledFor: new Date(origAt).toISOString(), reminderId: origId, deviceId, reminder },
+    ...text,
+    tag,
+    count,
+    data: {
+      medId: anchor.medId,
+      scheduledFor: new Date(anchor.at).toISOString(),
+      reminderId: tag,
+      deviceId,
+      count,
+      reminder,
+    },
   };
+}
+
+function membersOf(r: StoredReminder): Array<PushDose & { id: string }> {
+  if (r.doses?.length) return r.doses.map((d) => ({ ...d, id: doseId(d.medId, d.at) }));
+  return [{ medId: r.medId, at: r.origAt ?? r.at, id: r.origId ?? r.id }];
 }
 
 type SendResult = 'ok' | 'gone' | 'error';
@@ -263,15 +309,19 @@ async function pushTo(deviceId: string, rec: DeviceRecord, payload: unknown): Pr
     return 'ok';
   } catch (err) {
     const status = (err as { statusCode?: number }).statusCode;
-    // 404/410: subscription expired. 401/403: it was created for a different VAPID key.
-    if (status === 404 || status === 410 || status === 401 || status === 403) {
-      console.warn(`[push] ${deviceId.slice(0, 6)}… subscription no longer valid (${status}); removing device.`);
+    const rawBody = (err as { body?: string }).body;
+    const detail =
+      typeof rawBody === 'string'
+        ? rawBody.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 200)
+        : '';
+    const why = `${status ?? 'network'}${detail ? `: ${detail}` : ''}`;
+    // Only 404/410 mean the subscription is gone; 401/403 usually mean a VAPID/contact problem.
+    if (status === 404 || status === 410) {
+      console.warn(`[push] ${deviceId.slice(0, 6)}… subscription no longer valid (${why}); removing device.`);
       return 'gone';
     }
-    console.warn(
-      `[push] send failed for ${deviceId.slice(0, 6)}… (${status ?? 'network'}):`,
-      (err as Error).message ?? err,
-    );
+    if (status) console.warn(`[push] send failed for ${deviceId.slice(0, 6)}… (${why}).`);
+    else console.warn(`[push] send failed for ${deviceId.slice(0, 6)}… (${why}):`, (err as Error).message ?? err);
     return 'error';
   }
 }
@@ -308,7 +358,9 @@ async function tick(): Promise<void> {
         if (result === 'ok') {
           finished.add(r.id);
           // The device may have unsubscribed while we were awaiting the push service.
-          if (devices.get(deviceId) === rec) markSent(deviceId, r.origId ?? r.id);
+          if (devices.get(deviceId) === rec) {
+            for (const m of membersOf(r)) markSent(deviceId, m.id);
+          }
         } else if (result === 'gone') {
           gone = true;
           break;
@@ -438,16 +490,52 @@ app.post(
     const next: StoredReminder[] = [];
     for (const item of body.reminders) {
       const r = parseReminder(item);
-      if (r.at <= now || seen.has(r.id) || sent?.has(r.id)) continue;
-      seen.add(r.id);
-      next.push(r);
+      let out: StoredReminder | null;
+      if (!r.doses) {
+        out = r.at <= now || sent?.has(r.id) ? null : r;
+      } else {
+        const left = r.doses.filter((d) => d.at > now && !sent?.has(doseId(d.medId, d.at)));
+        const first = left[0];
+        if (!first) out = null;
+        else if (left.length === r.doses.length && r.at > now) out = r;
+        else {
+          const doses = left.length >= 2 ? left : undefined;
+          out = {
+            id: doseId(first.medId, first.at),
+            medId: first.medId,
+            at: first.at,
+            ...reminderText(left.length),
+            ...(doses ? { doses } : {}),
+          };
+        }
+      }
+      if (!out || seen.has(out.id)) continue;
+      seen.add(out.id);
+      next.push(out);
     }
-    // Snoozed copies are server-side only. Keep them unless the dose was handled in the app,
-    // or the medication no longer has reminders (deleted, or notifications turned off).
-    const activeMeds = new Set(next.map((r) => r.medId));
+    // Snoozed copies are server-side only. Keep each dose in one unless it was handled in the app
+    // (dismissed) or its medication no longer has reminders (deleted, or notifications turned off).
+    const activeMeds = new Set<string>();
+    for (const r of next) for (const m of membersOf(r)) activeMeds.add(m.medId);
     for (const s of rec.reminders) {
-      const keep = s.snoozed && s.at > now && activeMeds.has(s.medId) && !dismissed.has(s.origId ?? '') && !seen.has(s.id);
-      if (keep) next.push(s);
+      if (!s.snoozed || s.at <= now || seen.has(s.id)) continue;
+      const members = membersOf(s);
+      const keep = members.filter((m) => activeMeds.has(m.medId) && !dismissed.has(m.id));
+      if (!keep.length) continue;
+      if (keep.length === members.length) {
+        next.push({ ...s, ...reminderText(members.length) });
+      } else {
+        const group = keep.length >= 2;
+        const { doses: _oldDoses, ...base } = s;
+        next.push({
+          ...base,
+          ...reminderText(keep.length),
+          medId: keep[0].medId,
+          origId: group ? s.origId : keep[0].id,
+          origAt: keep[0].at,
+          ...(group ? { doses: keep.map(({ medId, at }) => ({ medId, at })) } : {}),
+        });
+      }
     }
     next.sort((a, b) => a.at - b.at);
     rec.reminders = next.slice(0, MAX_REMINDERS);
@@ -467,7 +555,7 @@ app.post(
     if (!Number.isFinite(minutes) || minutes < 1 || minutes > 120) return bad('minutes must be between 1 and 120');
     const rec = getDevice(deviceId);
     const at = Date.now() + Math.round(minutes * 60_000);
-    // One pending snooze per original reminder.
+    // One pending snooze per original reminder (for a group: the whole group).
     rec.reminders = rec.reminders.filter((r) => (r.origId ?? r.id) !== reminder.id || !r.snoozed);
     if (rec.reminders.length >= MAX_REMINDERS) return bad('too many reminders');
     rec.reminders.push({

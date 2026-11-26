@@ -52,7 +52,7 @@ export async function closeShownNotifications(): Promise<void> {
  * account was deleted on another device.
  */
 export async function wipeDevice(user: User, opts: { keepFirebaseSignIn?: boolean } = {}): Promise<void> {
-  // Reminders mention the medications (unless discreet), so cancel them here and on the push server.
+  // Reminders no longer name medications, but cancel them here and on the push server anyway.
   await disablePush().catch(() => {});
   forgetReminderState();
   await closeShownNotifications();

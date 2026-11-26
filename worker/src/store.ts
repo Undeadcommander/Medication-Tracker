@@ -1,7 +1,8 @@
 // The reminder store and scheduler: one SQLite-backed Durable Object holds every device's push
 // subscription and reminder queue, and its alarm fires at the next due reminder.
 import { DurableObject } from 'cloudflare:workers';
-import type { PushReminder } from '../../shared/types';
+import { doseId, reminderText } from '../../shared/reminderText';
+import type { PushDose } from '../../shared/types';
 import {
   HttpError,
   MAX_DISMISSED,
@@ -14,7 +15,16 @@ import {
   parseSubscription,
   readJson,
 } from './validate';
-import { MAX_PLAINTEXT, VapidSigner, normaliseSubject, sendPush, type PushTarget, type SendResult } from './webpush';
+import {
+  MAX_PLAINTEXT,
+  loadVapid,
+  normaliseSubscriptionKeys,
+  sendPush,
+  type PushTarget,
+  type SendResult,
+  type VapidLoad,
+  type VapidSigner,
+} from './webpush';
 
 export interface Env {
   PUSH_STORE: DurableObjectNamespace<PushStore>;
@@ -28,29 +38,53 @@ export interface Env {
 
 /** Same as server/index.ts: a reminder more than 15 minutes late is dropped, not sent. */
 export const STALE_MS = 15 * 60_000;
-/** A failed send (push service 5xx/429/network) is retried after this, like the old 20 s tick. */
+/** First retry after a failed send (push service 4xx/5xx/network), like the old 20 s tick... */
 export const RETRY_MS = 20_000;
-/** "Recently sent" ids are remembered for an hour so a late client sync can't re-queue them. */
+/** ...then doubling up to this, so a failing endpoint costs a handful of tries before going stale. */
+export const MAX_RETRY_MS = 5 * 60_000;
+/** "Recently sent" dose ids are remembered for an hour so a late client sync can't re-queue them. */
 export const SENT_TTL_MS = 3_600_000;
+/** Per device, persisted (survives the object being evicted from memory). */
 export const TEST_COOLDOWN_MS = 5_000;
+/** All test pushes share a token bucket: a burst of this many, then one per TEST_REFILL_MS. */
+export const TEST_BUCKET_SIZE = 10;
+export const TEST_REFILL_MS = 60_000;
 /**
  * Pushes per alarm run. Each is one subrequest (the free plan allows 50 per invocation) and
- * roughly 0.3-0.5 ms of CPU for the ECDH + HKDF + AES-GCM work (VAPID tokens are cached), so 10
- * keeps a run well inside the 10 ms CPU budget. Leftovers re-arm the alarm immediately.
+ * roughly 0.3-0.5 ms of CPU for the ECDH + HKDF + AES-GCM work (VAPID tokens are cached).
+ * Leftovers re-arm the alarm immediately.
  */
 export const BATCH_SIZE = 10;
-/** Bounds storage for this single-user deployment; new devices beyond it get 503. */
+/** Pushes in flight at once (Workers allow 6 simultaneous outbound connections). */
+export const PUSH_CONCURRENCY = 6;
+/** Bounds storage for this single-user deployment. When full, a new device evicts a stale one. */
 export const MAX_DEVICES = 200;
+/** A device with a successful delivery and activity within this long is never evicted. */
+export const PROTECT_MS = 7 * 86_400_000;
+/** No-op syncs refresh a device's "last seen" time at most this often (saves a row write). */
+export const HEARTBEAT_MS = 3_600_000;
+/** Push attempts per device per UTC day: devices that have received a push, and ones that haven't yet. */
+export const DAILY_PUSHES = 120;
+export const DAILY_PUSHES_UNPROVEN = 20;
+/** Requests per client IP (IPv6: per /64) per window, by route kind. */
+export const IP_WINDOW_MS = 10 * 60_000;
+export const IP_LIMITS = { subscribe: 10, test: 6, write: 120 } as const;
+const MAX_IP_KEYS = 5_000;
 /** The cron watchdog re-arms an alarm that is missing or this overdue. */
 export const ALARM_OVERDUE_MS = 2 * 60_000;
+/** Alarm delay after an error, or while push is misconfigured. */
+const BACKOFF_MS = 60_000;
+const DAY_MS = 86_400_000;
 
-interface ReminderRow {
+type IpClass = keyof typeof IP_LIMITS;
+
+export interface ReminderRow {
   device_id: string;
   id: string;
   med_id: string;
   at: number;
-  title: string;
-  body: string;
+  /** Grouped reminder: JSON [[medId, at], ...] (2+ doses, earliest first); null for one dose. */
+  doses: string | null;
   snoozed: number;
   orig_id: string | null;
   orig_at: number | null;
@@ -58,40 +92,143 @@ interface ReminderRow {
 }
 
 interface DueRow extends ReminderRow {
+  due_at: number;
+  tries: number;
   endpoint: string;
   p256dh: string;
   auth: string;
   rev: number;
+  last_ok: number | null;
+  day: number;
+  day_sends: number;
+}
+
+interface DeviceRow {
+  rev: number;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  expiration: number | null;
+  updated_at: number;
+  last_ok: number | null;
+  last_test: number | null;
+  [key: string]: SqlStorageValue;
 }
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 
-export function payloadFor(deviceId: string, r: ReminderRow): string {
-  const origId = r.orig_id ?? r.id;
-  const origAt = r.orig_at ?? r.at;
-  const build = (title: string, body: string) => {
-    const reminder: PushReminder = { id: origId, medId: r.med_id, at: origAt, title, body };
-    return JSON.stringify({
-      title,
-      body,
-      tag: origId,
-      data: { medId: r.med_id, scheduledFor: new Date(origAt).toISOString(), reminderId: origId, deviceId, reminder },
-    });
-  };
-  const full = build(r.title, r.body);
-  // Text is capped at 120 + 300 characters, which fits unless it is mostly escaped control
-  // characters or 4-byte symbols. Shorten rather than never deliver it.
-  if (new TextEncoder().encode(full).length <= MAX_PLAINTEXT) return full;
-  return build(r.title.slice(0, 60), r.body.slice(0, 100));
+const encodeDoses = (doses: PushDose[]): string => JSON.stringify(doses.map((d) => [d.medId, d.at]));
+
+function decodeDoses(raw: string | null): PushDose[] | null {
+  if (!raw) return null;
+  try {
+    const list = (JSON.parse(raw) as [string, number][]).map(([medId, at]) => ({ medId, at }));
+    return list.length ? list : null;
+  } catch {
+    return null;
+  }
 }
+
+/** The doses a queued reminder notifies about, with their ids (what "sent" and "dismissed" track). */
+function membersOf(r: ReminderRow): Array<PushDose & { id: string }> {
+  const doses = decodeDoses(r.doses);
+  if (doses) return doses.map((d) => ({ ...d, id: doseId(d.medId, d.at) }));
+  return [{ medId: r.med_id, at: r.orig_at ?? r.at, id: r.orig_id ?? r.id }];
+}
+
+const byteLength = (s: string) => new TextEncoder().encode(s).length;
+
+/**
+ * The push payload public/sw.js expects. Text is always the discreet wording for the number of
+ * doses; whatever title/body the client sent is never stored or forwarded.
+ */
+export function payloadFor(deviceId: string, r: ReminderRow): string {
+  const tag = r.orig_id ?? r.id;
+  const doses = decodeDoses(r.doses);
+  if (!doses) {
+    const text = reminderText(1);
+    const at = r.orig_at ?? r.at;
+    const reminder = { id: tag, medId: r.med_id, at, ...text };
+    return JSON.stringify({
+      ...text,
+      tag,
+      data: { medId: r.med_id, scheduledFor: new Date(at).toISOString(), reminderId: tag, deviceId, reminder },
+    });
+  }
+  const count = doses.length;
+  const text = reminderText(count);
+  const anchor = doses[0];
+  const build = (list: PushDose[]) =>
+    JSON.stringify({
+      ...text,
+      tag,
+      count,
+      data: {
+        medId: anchor.medId,
+        scheduledFor: new Date(anchor.at).toISOString(),
+        reminderId: tag,
+        deviceId,
+        count,
+        reminder: { id: tag, medId: anchor.medId, at: anchor.at, ...text, doses: list },
+      },
+    });
+  // Validation bounds a group (20 doses, ids of at most 100 characters) to fit; if it somehow
+  // doesn't, keep the count and send fewer doses for "Snooze" to carry (UTF-8 bytes, not UTF-16).
+  let list = doses;
+  let out = build(list);
+  while (byteLength(out) > MAX_PLAINTEXT && list.length > 1) {
+    list = list.slice(0, -1);
+    out = build(list);
+  }
+  return out;
+}
+
+/** Rate-limit key for a client address: IPv4 as is, IPv6 by its /64 (one subscriber's block). */
+export function ipKey(ip: string): string {
+  const raw = ip.trim().toLowerCase();
+  if (!raw.includes(':')) return raw;
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(raw);
+  if (mapped) return mapped[1];
+  const [head, tail] = raw.split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail !== undefined && tail !== '' ? tail.split(':') : [];
+  const groups = tail === undefined ? h : [...h, ...new Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups
+    .slice(0, 4)
+    .map((g) => g.replace(/^0+(?=.)/, ''))
+    .join(':')}::/64`;
+}
+
+/** Runs `fn` over `items` with at most `limit` in flight. `fn` must not throw. */
+async function runPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) await fn(items[next++]);
+  });
+  await Promise.allSettled(lanes);
+}
+
+const retryDelay = (tries: number) => Math.min(RETRY_MS * 2 ** Math.min(tries, 10), MAX_RETRY_MS);
+
+const ROUTE_CLASS: Record<string, IpClass> = {
+  '/api/push/subscribe': 'subscribe',
+  '/api/push/test': 'test',
+  '/api/push/unsubscribe': 'write',
+  '/api/push/reminders': 'write',
+  '/api/push/snooze': 'write',
+};
+
+const DUE_COLUMNS = `r.device_id, r.id, r.med_id, r.at, r.doses, r.snoozed, r.orig_id, r.orig_at, r.due_at, r.tries,
+  d.endpoint, d.p256dh, d.auth, d.rev, d.last_ok, d.day, d.day_sends`;
 
 export class PushStore extends DurableObject<Env> {
   private sql: SqlStorage;
-  private signer: VapidSigner | null = null;
+  private vapidLoad: Promise<VapidLoad> | null = null;
   private ticking = false;
-  private lastTest = new Map<string, number>();
   private extraOrigins: Set<string>;
+  /** Per-IP request counts. In memory: a flood keeps the object alive, and losing it only resets limits. */
+  private ipHits = new Map<string, { n: number; start: number }>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -105,22 +242,28 @@ export class PushStore extends DurableObject<Env> {
         auth TEXT NOT NULL,
         expiration REAL,
         rev INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_ok INTEGER,
+        last_test INTEGER,
+        day INTEGER NOT NULL DEFAULT 0,
+        day_sends INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS reminders (
         device_id TEXT NOT NULL,
         id TEXT NOT NULL,
         med_id TEXT NOT NULL,
         at INTEGER NOT NULL,
-        title TEXT NOT NULL,
-        body TEXT NOT NULL,
+        doses TEXT,
         snoozed INTEGER NOT NULL DEFAULT 0,
         orig_id TEXT,
         orig_at INTEGER,
         due_at INTEGER NOT NULL,
+        tries INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (device_id, id)
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS reminders_due ON reminders (due_at);
+      CREATE INDEX IF NOT EXISTS reminders_device_due ON reminders (device_id, due_at);
       CREATE TABLE IF NOT EXISTS sent (
         device_id TEXT NOT NULL,
         id TEXT NOT NULL,
@@ -128,6 +271,11 @@ export class PushStore extends DurableObject<Env> {
         PRIMARY KEY (device_id, id)
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS sent_at ON sent (at);
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        num REAL NOT NULL,
+        at INTEGER NOT NULL
+      ) WITHOUT ROWID;
     `);
   }
 
@@ -148,17 +296,26 @@ export class PushStore extends DurableObject<Env> {
     const method = request.method;
     if (method === 'GET' && path === '/api/health') {
       const devices = this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM devices').one().n;
-      return json({ ok: true, devices, time: new Date().toISOString() });
+      const v = await this.vapid();
+      const time = new Date().toISOString();
+      return v.ok
+        ? json({ ok: true, devices, push: 'ready', time })
+        : json({ ok: false, devices, push: 'misconfigured', problem: v.problem, time }, 503);
     }
     if (method === 'GET' && path === '/api/push/public-key') {
-      return json({ publicKey: this.vapidSigner().config.publicKey });
+      const v = await this.vapid();
+      if (!v.ok) throw new HttpError(503, 'push not configured');
+      return json({ publicKey: v.signer.config.publicKey });
     }
-    if (method === 'POST') {
+    if (method === 'POST' && path in ROUTE_CLASS) {
+      // Cloudflare sets CF-Connecting-IP on every request it receives (clients can't forge it).
+      const ip = request.headers.get('CF-Connecting-IP');
+      if (ip && !this.allowIp(ROUTE_CLASS[path], ip)) throw new HttpError(429, 'slow down');
       switch (path) {
         case '/api/push/subscribe':
-          return json(this.subscribe(await readJson(request)));
+          return json(await this.subscribe(await readJson(request)));
         case '/api/push/unsubscribe':
-          return json(this.unsubscribe(await readJson(request)));
+          return json(await this.unsubscribe(await readJson(request)));
         case '/api/push/reminders':
           return json(await this.setReminders(await readJson(request)));
         case '/api/push/snooze':
@@ -170,14 +327,57 @@ export class PushStore extends DurableObject<Env> {
     return json({ error: 'not found' }, 404);
   }
 
-  private vapidSigner(): VapidSigner {
-    if (!this.signer) {
-      const publicKey = this.env.VAPID_PUBLIC_KEY?.trim();
-      const privateKey = this.env.VAPID_PRIVATE_KEY?.trim();
-      if (!publicKey || !privateKey) throw new HttpError(503, 'push not configured');
-      this.signer = new VapidSigner({ publicKey, privateKey, subject: normaliseSubject(this.env.VAPID_SUBJECT) });
+  /** Fixed-window counter per (route kind, client IP). */
+  private allowIp(kind: IpClass, ip: string, now = Date.now()): boolean {
+    const key = `${kind}|${ipKey(ip)}`;
+    let entry = this.ipHits.get(key);
+    if (!entry || now - entry.start >= IP_WINDOW_MS) {
+      if (this.ipHits.size >= MAX_IP_KEYS) {
+        for (const [k, e] of this.ipHits) if (now - e.start >= IP_WINDOW_MS) this.ipHits.delete(k);
+        // Still full: forget the oldest windows (Maps iterate in insertion order).
+        for (const k of this.ipHits.keys()) {
+          if (this.ipHits.size < MAX_IP_KEYS) break;
+          this.ipHits.delete(k);
+        }
+      }
+      entry = { n: 0, start: now };
+      this.ipHits.delete(key);
+      this.ipHits.set(key, entry);
     }
-    return this.signer;
+    entry.n++;
+    return entry.n <= IP_LIMITS[kind];
+  }
+
+  /** Test hook: forget per-IP counts. */
+  resetRateLimits(): void {
+    this.ipHits.clear();
+  }
+
+  /**
+   * VAPID settings, validated once per object lifetime (a secret change restarts the object).
+   * Misconfigured: no public key (503), health says so, nothing is sent and no device is dropped.
+   */
+  private vapid(): Promise<VapidLoad> {
+    this.vapidLoad ??= loadVapid({
+      publicKey: this.env.VAPID_PUBLIC_KEY,
+      privateKey: this.env.VAPID_PRIVATE_KEY,
+      subject: this.env.VAPID_SUBJECT,
+    }).then((v) => {
+      if (!v.ok) console.error(`[push] push is not configured, no reminders will be sent: ${v.problem}`);
+      return v;
+    });
+    return this.vapidLoad;
+  }
+
+  private device(deviceId: string): DeviceRow | null {
+    return (
+      this.sql
+        .exec<DeviceRow>(
+          'SELECT rev, endpoint, p256dh, auth, expiration, updated_at, last_ok, last_test FROM devices WHERE device_id = ?',
+          deviceId,
+        )
+        .toArray()[0] ?? null
+    );
   }
 
   private deviceRev(deviceId: string): number | null {
@@ -185,10 +385,10 @@ export class PushStore extends DurableObject<Env> {
     return row ? row.rev : null;
   }
 
-  private requireDevice(deviceId: string): number {
-    const rev = this.deviceRev(deviceId);
-    if (rev === null) throw new HttpError(404, 'device not subscribed');
-    return rev;
+  private requireDevice(deviceId: string): DeviceRow {
+    const d = this.device(deviceId);
+    if (!d) throw new HttpError(404, 'device not subscribed');
+    return d;
   }
 
   private dropDevice(deviceId: string): void {
@@ -199,36 +399,77 @@ export class PushStore extends DurableObject<Env> {
     });
   }
 
-  subscribe(raw: unknown) {
+  /**
+   * Makes room for a new device. /subscribe is unauthenticated, so a flood of fake devices must
+   * not lock out real ones: evict a device that has never received a push (least recently seen
+   * first), else one that has been inactive for PROTECT_MS. Devices that receive pushes and keep
+   * syncing are never evicted; if every slot holds one, the new device is refused.
+   */
+  private evictForNewDevice(now: number): void {
+    const victim = this.sql
+      .exec<{ device_id: string; last_ok: number | null; seen: number }>(
+        `SELECT device_id, last_ok, MAX(updated_at, COALESCE(last_ok, 0)) AS seen FROM devices
+         ORDER BY (last_ok IS NOT NULL), seen LIMIT 1`,
+      )
+      .toArray()[0];
+    if (!victim || (victim.last_ok !== null && now - victim.seen < PROTECT_MS)) throw new HttpError(503, 'server full');
+    console.warn(`[push] device limit reached; evicting ${victim.device_id.slice(0, 6)}… (${victim.last_ok === null ? 'never delivered' : 'inactive'}).`);
+    this.dropDevice(victim.device_id);
+  }
+
+  async subscribe(raw: unknown) {
     const body = asObject(raw);
     const deviceId = parseDeviceId(body.deviceId);
     const sub = parseSubscription(body.subscription, this.extraOrigins);
-    const rev = this.deviceRev(deviceId);
-    if (rev === null) {
+    // Keys that can't encrypt would fail every send: refuse them now, stored normalised.
+    const keys = (await normaliseSubscriptionKeys(sub.keys)) ?? bad('invalid subscription keys');
+    const now = Date.now();
+    const existing = this.device(deviceId);
+    if (
+      existing &&
+      existing.endpoint === sub.endpoint &&
+      existing.p256dh === keys.p256dh &&
+      existing.auth === keys.auth &&
+      existing.expiration === sub.expirationTime
+    ) {
+      // Same subscription again: nothing to write but a heartbeat.
+      if (now - existing.updated_at >= HEARTBEAT_MS) {
+        this.sql.exec('UPDATE devices SET updated_at = ? WHERE device_id = ?', now, deviceId);
+      }
+      return { ok: true };
+    }
+    let evicted = false;
+    if (!existing) {
       const n = this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM devices').one().n;
-      if (n >= MAX_DEVICES) throw new HttpError(503, 'server full');
+      if (n >= MAX_DEVICES) {
+        this.evictForNewDevice(now);
+        evicted = true;
+      }
     }
     // Existing reminders are kept (same as server/index.ts); `rev` changes so an in-flight send
     // to the old subscription can't remove the new one.
     this.sql.exec(
-      `INSERT INTO devices (device_id, endpoint, p256dh, auth, expiration, rev, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO devices (device_id, endpoint, p256dh, auth, expiration, rev, updated_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (device_id) DO UPDATE SET endpoint = excluded.endpoint, p256dh = excluded.p256dh,
          auth = excluded.auth, expiration = excluded.expiration, rev = excluded.rev, updated_at = excluded.updated_at`,
       deviceId,
       sub.endpoint,
-      sub.keys.p256dh,
-      sub.keys.auth,
+      keys.p256dh,
+      keys.auth,
       sub.expirationTime,
-      (rev ?? 0) + 1,
-      Date.now(),
+      (existing?.rev ?? 0) + 1,
+      now,
+      now,
     );
+    if (evicted) await this.rearm();
     return { ok: true };
   }
 
-  unsubscribe(raw: unknown) {
+  async unsubscribe(raw: unknown) {
     const deviceId = parseDeviceId(asObject(raw).deviceId);
     this.dropDevice(deviceId);
+    await this.rearm();
     return { ok: true };
   }
 
@@ -244,7 +485,7 @@ export class PushStore extends DurableObject<Env> {
     );
     // Same order as server/index.ts: an unknown device is a 404 (the client re-subscribes on it)
     // before any item is validated; a bad item then rejects the whole request untouched.
-    this.requireDevice(deviceId);
+    const device = this.requireDevice(deviceId);
     const parsed = body.reminders.map(parseReminder);
     const now = Date.now();
     const sent = new Set(
@@ -256,46 +497,75 @@ export class PushStore extends DurableObject<Env> {
     const existing = new Map(
       this.sql
         .exec<ReminderRow>(
-          'SELECT device_id, id, med_id, at, title, body, snoozed, orig_id, orig_at FROM reminders WHERE device_id = ?',
+          'SELECT device_id, id, med_id, at, doses, snoozed, orig_id, orig_at FROM reminders WHERE device_id = ?',
           deviceId,
         )
         .toArray()
         .map((r) => [r.id, r]),
     );
 
+    const row = (medId: string, at: number, id: string, doses: PushDose[] | null): ReminderRow => ({
+      device_id: deviceId,
+      id,
+      med_id: medId,
+      at,
+      doses: doses && doses.length >= 2 ? encodeDoses(doses) : null,
+      snoozed: 0,
+      orig_id: null,
+      orig_at: null,
+    });
     const seen = new Set<string>();
     const next: ReminderRow[] = [];
     for (const r of parsed) {
-      if (r.at <= now || seen.has(r.id) || sent.has(r.id)) continue;
-      seen.add(r.id);
-      next.push({
-        device_id: deviceId,
-        id: r.id,
-        med_id: r.medId,
-        at: r.at,
-        title: r.title,
-        body: r.body,
-        snoozed: 0,
-        orig_id: null,
-        orig_at: null,
-      });
+      let out: ReminderRow | null;
+      if (!r.doses) {
+        out = r.at <= now || sent.has(r.id) ? null : row(r.medId, r.at, r.id, null);
+      } else {
+        // A group never re-notifies a dose already delivered (e.g. in an earlier, larger group):
+        // those doses leave it, and what is left fires at its earliest remaining dose.
+        const left = r.doses.filter((d) => d.at > now && !sent.has(doseId(d.medId, d.at)));
+        const first = left[0];
+        if (!first) out = null;
+        else if (left.length === r.doses.length && r.at > now) out = row(r.medId, r.at, r.id, left);
+        else out = row(first.medId, first.at, doseId(first.medId, first.at), left);
+      }
+      if (!out || seen.has(out.id)) continue;
+      seen.add(out.id);
+      next.push(out);
     }
-    // Snoozed copies are server-side only. Keep them unless the dose was handled in the app,
-    // or the medication no longer has reminders (deleted, or notifications turned off).
-    const activeMeds = new Set(next.map((r) => r.med_id));
+    // Snoozed copies are server-side only. Keep each dose in one unless it was handled in the app
+    // (dismissed) or its medication no longer has reminders (deleted, or notifications turned off).
+    const activeMeds = new Set<string>();
+    for (const r of next) for (const m of membersOf(r)) activeMeds.add(m.medId);
     for (const s of existing.values()) {
-      const keep =
-        s.snoozed && s.at > now && activeMeds.has(s.med_id) && !dismissed.has(s.orig_id ?? '') && !seen.has(s.id);
-      if (keep) next.push(s);
+      // A snooze that came due but hasn't been sent yet (the alarm is about to run) is kept too.
+      if (!s.snoozed || s.at < now - STALE_MS || seen.has(s.id)) continue;
+      const members = membersOf(s);
+      const keep = members.filter((m) => activeMeds.has(m.medId) && !dismissed.has(m.id));
+      if (!keep.length) continue;
+      if (keep.length === members.length) next.push(s);
+      else {
+        const group = keep.length >= 2;
+        next.push({
+          ...s,
+          med_id: keep[0].medId,
+          doses: group ? encodeDoses(keep) : null,
+          orig_id: group ? s.orig_id : keep[0].id,
+          orig_at: keep[0].at,
+        });
+      }
     }
     next.sort((a, b) => a.at - b.at);
     const final = next.slice(0, MAX_REMINDERS);
 
     // Write only the difference: a typical sync changes a handful of rows, not all of them.
     const keepIds = new Set(final.map((r) => r.id));
+    let changed = false;
     this.ctx.storage.transactionSync(() => {
       for (const id of existing.keys()) {
-        if (!keepIds.has(id)) this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, id);
+        if (keepIds.has(id)) continue;
+        this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, id);
+        changed = true;
       }
       for (const r of final) {
         const old = existing.get(r.id);
@@ -303,30 +573,32 @@ export class PushStore extends DurableObject<Env> {
           old &&
           old.med_id === r.med_id &&
           old.at === r.at &&
-          old.title === r.title &&
-          old.body === r.body &&
+          old.doses === r.doses &&
           old.snoozed === r.snoozed &&
           old.orig_id === r.orig_id &&
           old.orig_at === r.orig_at;
-        if (same) continue; // keeps its due_at (e.g. a pending retry)
+        if (same) continue; // keeps its due_at and tries (e.g. a pending retry)
+        changed = true;
         this.sql.exec(
-          `INSERT OR REPLACE INTO reminders (device_id, id, med_id, at, title, body, snoozed, orig_id, orig_at, due_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT OR REPLACE INTO reminders (device_id, id, med_id, at, doses, snoozed, orig_id, orig_at, due_at, tries)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
           deviceId,
           r.id,
           r.med_id,
           r.at,
-          r.title,
-          r.body,
+          r.doses,
           r.snoozed,
           r.orig_id,
           r.orig_at,
           r.at,
         );
       }
-      this.sql.exec('UPDATE devices SET updated_at = ? WHERE device_id = ?', now, deviceId);
+      // "Last seen" (used to pick eviction victims): on a change, else at most once per HEARTBEAT_MS.
+      if (changed || now - device.updated_at >= HEARTBEAT_MS) {
+        this.sql.exec('UPDATE devices SET updated_at = ? WHERE device_id = ?', now, deviceId);
+      }
     });
-    await this.rearm();
+    if (changed) await this.rearm();
     return { ok: true, count: final.length };
   }
 
@@ -340,19 +612,18 @@ export class PushStore extends DurableObject<Env> {
     const now = Date.now();
     const at = now + Math.round(minutes * 60_000);
     this.ctx.storage.transactionSync(() => {
-      // One pending snooze per original reminder.
+      // One pending snooze per original reminder (for a group: the whole group).
       this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND snoozed = 1 AND orig_id = ?', deviceId, reminder.id);
       const n = this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM reminders WHERE device_id = ?', deviceId).one().n;
       if (n >= MAX_REMINDERS) bad('too many reminders');
       this.sql.exec(
-        `INSERT OR REPLACE INTO reminders (device_id, id, med_id, at, title, body, snoozed, orig_id, orig_at, due_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO reminders (device_id, id, med_id, at, doses, snoozed, orig_id, orig_at, due_at, tries)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 0)`,
         deviceId,
         `${reminder.medId.slice(0, 40)}~snooze@${at}`,
         reminder.medId,
         at,
-        reminder.title,
-        reminder.body,
+        reminder.doses ? encodeDoses(reminder.doses) : null,
         reminder.id,
         reminder.at,
         at,
@@ -365,15 +636,17 @@ export class PushStore extends DurableObject<Env> {
 
   async test(raw: unknown) {
     const deviceId = parseDeviceId(asObject(raw).deviceId);
-    const rev = this.requireDevice(deviceId);
+    const device = this.requireDevice(deviceId);
+    const v = await this.vapid();
+    if (!v.ok) throw new HttpError(503, 'push not configured');
     const now = Date.now();
-    for (const [dev, t] of this.lastTest) if (now - t > TEST_COOLDOWN_MS) this.lastTest.delete(dev);
-    if (now - (this.lastTest.get(deviceId) ?? 0) < TEST_COOLDOWN_MS) throw new HttpError(429, 'slow down');
-    this.lastTest.set(deviceId, now);
-    const target = this.target(deviceId)!;
+    if (device.last_test !== null && now - device.last_test < TEST_COOLDOWN_MS) throw new HttpError(429, 'slow down');
+    if (!this.takeTestToken(now)) throw new HttpError(429, 'slow down');
+    this.sql.exec('UPDATE devices SET last_test = ? WHERE device_id = ?', now, deviceId);
     const result = await this.push(
+      v.signer,
       deviceId,
-      target,
+      { endpoint: device.endpoint, keys: { p256dh: device.p256dh, auth: device.auth } },
       JSON.stringify({
         title: 'Dosely test',
         body: 'Notifications are working on this device.',
@@ -381,131 +654,212 @@ export class PushStore extends DurableObject<Env> {
         data: { test: true, deviceId },
       }),
     );
+    const sameDevice = this.deviceRev(deviceId) === device.rev;
+    if (result === 'ok') {
+      if (sameDevice) this.sql.exec('UPDATE devices SET last_ok = ? WHERE device_id = ?', Date.now(), deviceId);
+      return { ok: true };
+    }
     if (result === 'gone') {
-      if (this.deviceRev(deviceId) === rev) this.dropDevice(deviceId);
+      if (sameDevice) {
+        this.dropDevice(deviceId);
+        await this.rearm();
+      }
       throw new HttpError(410, 'subscription expired');
     }
-    if (result === 'error') throw new HttpError(502, 'push service rejected the message');
-    return { ok: true };
+    throw new HttpError(502, 'push service rejected the message');
   }
 
-  private target(deviceId: string): PushTarget | null {
-    const d = this.sql
-      .exec<{ endpoint: string; p256dh: string; auth: string }>(
-        'SELECT endpoint, p256dh, auth FROM devices WHERE device_id = ?',
-        deviceId,
-      )
-      .toArray()[0];
-    return d ? { endpoint: d.endpoint, keys: { p256dh: d.p256dh, auth: d.auth } } : null;
+  /** Global token bucket for test pushes (persisted), so rotating device ids can't spam pushes. */
+  private takeTestToken(now: number): boolean {
+    const row = this.sql.exec<{ num: number; at: number }>("SELECT num, at FROM meta WHERE key = 'test_bucket'").toArray()[0];
+    const tokens = Math.min(TEST_BUCKET_SIZE, row ? row.num + Math.max(0, now - row.at) / TEST_REFILL_MS : TEST_BUCKET_SIZE);
+    if (tokens < 1) return false;
+    this.sql.exec("INSERT OR REPLACE INTO meta (key, num, at) VALUES ('test_bucket', ?, ?)", tokens - 1, now);
+    return true;
   }
 
-  private async push(deviceId: string, target: PushTarget, payload: string): Promise<SendResult> {
-    const { result, status } = await sendPush(this.vapidSigner(), target, payload, { ttl: 3600, urgency: 'high' });
-    if (result === 'gone') {
-      console.warn(`[push] ${deviceId.slice(0, 6)}… subscription no longer valid (${status}); removing device.`);
-    } else if (result === 'error') {
-      console.warn(`[push] send failed for ${deviceId.slice(0, 6)}… (${status || 'network'})`);
-    }
+  private async push(signer: VapidSigner, deviceId: string, target: PushTarget, payload: string): Promise<SendResult> {
+    const { result, status, detail } = await sendPush(signer, target, payload, { ttl: 3600, urgency: 'high' });
+    const who = `${deviceId.slice(0, 6)}…`;
+    const why = `${status || 'no response'}${detail ? `: ${detail}` : ''}`;
+    if (result === 'gone') console.warn(`[push] ${who} subscription no longer valid (${why}); removing device.`);
+    else if (result === 'drop') console.warn(`[push] ${who} message can't be sent (${why}); dropping it.`);
+    else if (result === 'error') console.warn(`[push] send failed for ${who} (${why}); will retry.`);
     return result;
   }
 
   // ---------- scheduling ----------
 
   /**
-   * Points the alarm at the earliest queued reminder, or clears it. Cheap: MIN over an index
-   * reads one row. `notBefore` keeps a failing tick from re-firing in a tight loop.
+   * Points the alarm at the earliest queued reminder, or clears it, writing only when that
+   * changes (each setAlarm is a billed row write). `notBefore` keeps a failing tick from
+   * re-firing in a tight loop; `force` re-sets an alarm that looks stuck.
    */
-  async rearm(notBefore = Date.now()): Promise<void> {
+  async rearm(notBefore = Date.now(), force = false): Promise<void> {
     const next = this.sql.exec<{ t: number | null }>('SELECT MIN(due_at) AS t FROM reminders').one().t;
-    if (next === null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Math.max(next, notBefore));
+    const current = await this.ctx.storage.getAlarm();
+    if (next === null) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const want = Math.max(next, notBefore);
+    if (current === want && !force) return;
+    await this.ctx.storage.setAlarm(want);
   }
 
   /** Called by the per-minute cron. Re-arms a lost or stuck alarm; normally reads one value. */
   async watchdog(): Promise<void> {
     const alarm = await this.ctx.storage.getAlarm();
-    if (alarm === null || alarm < Date.now() - ALARM_OVERDUE_MS) await this.rearm();
+    const now = Date.now();
+    if (alarm !== null && alarm >= now - ALARM_OVERDUE_MS) return;
+    await this.rearm(now, true); // nothing queued and no alarm: reads one index row, writes nothing
   }
 
   async alarm(): Promise<void> {
     await this.tick();
   }
 
+  /**
+   * Due reminders for one run (at most BATCH_SIZE). Normally just the earliest ones. With a
+   * backlog, devices take turns (each one's earliest first, devices that have received pushes
+   * before new ones), so one device with thousands of due reminders can't starve the others.
+   */
+  private selectDue(now: number): DueRow[] {
+    const head = this.sql
+      .exec<DueRow>(
+        `SELECT ${DUE_COLUMNS} FROM reminders r JOIN devices d ON d.device_id = r.device_id
+         WHERE r.due_at <= ? ORDER BY r.due_at, r.device_id LIMIT ?`,
+        now,
+        BATCH_SIZE + 1,
+      )
+      .toArray();
+    if (head.length <= BATCH_SIZE) return head;
+    const ranked: Array<{ row: DueRow; rank: number }> = [];
+    for (const { device_id } of this.sql.exec<{ device_id: string }>('SELECT device_id FROM devices').toArray()) {
+      const rows = this.sql
+        .exec<DueRow>(
+          `SELECT ${DUE_COLUMNS} FROM reminders r JOIN devices d ON d.device_id = r.device_id
+           WHERE r.device_id = ? AND r.due_at <= ? ORDER BY r.due_at LIMIT ?`,
+          device_id,
+          now,
+          BATCH_SIZE,
+        )
+        .toArray();
+      rows.forEach((row, rank) => ranked.push({ row, rank }));
+    }
+    ranked.sort(
+      (a, b) =>
+        a.rank - b.rank ||
+        Number(b.row.last_ok !== null) - Number(a.row.last_ok !== null) ||
+        a.row.due_at - b.row.due_at,
+    );
+    return ranked.slice(0, BATCH_SIZE).map((x) => x.row);
+  }
+
+  /** Sends one device's share of a run, in order, stopping if the subscription is gone. Returns attempts. */
+  private async sendForDevice(signer: VapidSigner, rows: DueRow[], now: number): Promise<number> {
+    const d = rows[0];
+    const deviceId = d.device_id;
+    const today = Math.floor(now / DAY_MS);
+    const used = d.day === today ? d.day_sends : 0;
+    const cap = d.last_ok !== null ? DAILY_PUSHES : DAILY_PUSHES_UNPROVEN;
+    if (used >= cap) {
+      // Bounds what one device (e.g. a fake one with thousands of reminders) can cost per day.
+      console.warn(`[push] ${deviceId.slice(0, 6)}… reached its daily limit of ${cap} pushes; dropping its due reminders.`);
+      this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND due_at <= ?', deviceId, now);
+      return 0;
+    }
+    let attempts = 0;
+    let lastOk: number | null = null;
+    for (const r of rows) {
+      if (used + attempts >= cap) break; // the rest stay due; the next run drops them
+      attempts++;
+      const target = { endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } };
+      const result = await this.push(signer, deviceId, target, payloadFor(deviceId, r));
+      // The device may have re-subscribed or unsubscribed while we awaited the push service.
+      const sameDevice = this.deviceRev(deviceId) === r.rev;
+      if (result === 'ok') {
+        lastOk = Date.now();
+        this.ctx.storage.transactionSync(() => {
+          this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, r.id);
+          if (!sameDevice) return;
+          for (const m of membersOf(r)) {
+            this.sql.exec('INSERT OR REPLACE INTO sent (device_id, id, at) VALUES (?, ?, ?)', deviceId, m.id, lastOk);
+          }
+        });
+      } else if (result === 'gone') {
+        if (sameDevice) this.dropDevice(deviceId);
+        return attempts; // skip the device's other reminders
+      } else if (result === 'drop') {
+        this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, r.id);
+      } else if (sameDevice) {
+        // Kept and retried with backoff until it goes stale (server/index.ts retried every 20 s).
+        this.sql.exec(
+          'UPDATE reminders SET due_at = ?, tries = tries + 1 WHERE device_id = ? AND id = ? AND due_at <= ?',
+          Date.now() + retryDelay(r.tries),
+          deviceId,
+          r.id,
+          now,
+        );
+      }
+    }
+    this.sql.exec(
+      'UPDATE devices SET day = ?, day_sends = ?, last_ok = COALESCE(?, last_ok) WHERE device_id = ? AND rev = ?',
+      today,
+      used + attempts,
+      lastOk,
+      deviceId,
+      d.rev,
+    );
+    return attempts;
+  }
+
   /** Sends up to BATCH_SIZE due reminders, then re-arms for the rest. Returns how many were attempted. */
   async tick(): Promise<number> {
-    // A tick already in flight (e.g. an alarm while /test awaits) re-arms when it ends.
+    // A tick already in flight re-arms when it ends.
     if (this.ticking) return 0;
     this.ticking = true;
     let attempted = 0;
-    let healthy = true;
+    let backoff = 0;
     try {
       const now = Date.now();
       this.sql.exec('DELETE FROM sent WHERE at < ?', now - SENT_TTL_MS);
       // Stale reminders are dropped, not sent (due_at >= at, so this range stays on the index).
       this.sql.exec('DELETE FROM reminders WHERE due_at <= ? AND at < ?', now, now - STALE_MS);
-      try {
-        this.vapidSigner();
-      } catch {
-        console.error('[push] VAPID keys are not configured; reminders are not being sent.');
-        healthy = false;
+      const v = await this.vapid();
+      if (!v.ok) {
+        // Misconfigured (logged once): send nothing, drop nothing, check again later.
+        backoff = BACKOFF_MS;
         return 0;
       }
-      const due = this.sql
-        .exec<DueRow>(
-          `SELECT r.device_id, r.id, r.med_id, r.at, r.title, r.body, r.snoozed, r.orig_id, r.orig_at,
-                  d.endpoint, d.p256dh, d.auth, d.rev
-           FROM reminders r JOIN devices d ON d.device_id = r.device_id
-           WHERE r.due_at <= ? ORDER BY r.due_at, r.device_id LIMIT ?`,
-          now,
-          BATCH_SIZE,
-        )
-        .toArray();
-      const gone = new Set<string>();
+      const due = this.selectDue(now);
+      const byDevice = new Map<string, DueRow[]>();
       for (const r of due) {
-        if (gone.has(r.device_id)) continue;
-        attempted++;
-        const target = { endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } };
-        const result = await this.push(r.device_id, target, payloadFor(r.device_id, r));
-        // The device may have re-subscribed or unsubscribed while we awaited the push service.
-        const sameDevice = this.deviceRev(r.device_id) === r.rev;
-        if (result === 'ok') {
-          this.ctx.storage.transactionSync(() => {
-            this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', r.device_id, r.id);
-            if (sameDevice) {
-              this.sql.exec(
-                'INSERT OR REPLACE INTO sent (device_id, id, at) VALUES (?, ?, ?)',
-                r.device_id,
-                r.orig_id ?? r.id,
-                Date.now(),
-              );
-            }
-          });
-        } else if (result === 'gone') {
-          gone.add(r.device_id);
-          if (sameDevice) this.dropDevice(r.device_id);
-        } else if (sameDevice) {
-          // Kept and retried shortly, until it goes stale (server/index.ts retried every 20 s tick).
-          this.sql.exec(
-            'UPDATE reminders SET due_at = ? WHERE device_id = ? AND id = ? AND due_at <= ?',
-            Date.now() + RETRY_MS,
-            r.device_id,
-            r.id,
-            now,
-          );
-        }
+        const list = byDevice.get(r.device_id);
+        if (list) list.push(r);
+        else byDevice.set(r.device_id, [r]);
       }
+      // Devices in parallel (bounded), each device's own reminders in order.
+      await runPool([...byDevice.values()], PUSH_CONCURRENCY, async (rows) => {
+        try {
+          attempted += await this.sendForDevice(v.signer, rows, now);
+        } catch (err) {
+          console.error('[push] send error:', err);
+          backoff = BACKOFF_MS;
+        }
+      });
       // Due rows without a device can't be sent (shouldn't exist: devices are dropped with their rows).
       if (due.length < BATCH_SIZE) {
         this.sql.exec('DELETE FROM reminders WHERE due_at <= ? AND device_id NOT IN (SELECT device_id FROM devices)', now);
       }
     } catch (err) {
       console.error('[push] scheduler error:', err);
-      healthy = false;
+      backoff = BACKOFF_MS;
     } finally {
       this.ticking = false;
       try {
         // Leftovers from a full batch are due now, so the alarm fires again right away.
-        await this.rearm(healthy ? Date.now() : Date.now() + 60_000);
+        await this.rearm(Date.now() + backoff);
       } catch (err) {
         console.error('[push] could not re-arm alarm:', err);
       }

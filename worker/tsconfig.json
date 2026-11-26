@@ -12,6 +12,6 @@
     "noUnusedParameters": true,
     "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
   },
-  "include": ["src", "test", "../shared/types.ts"],
+  "include": ["src", "test", "../shared/types.ts", "../shared/reminderText.ts"],
   "exclude": ["test/**/*.node.test.ts"]
 }

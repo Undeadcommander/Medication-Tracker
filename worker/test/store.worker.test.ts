@@ -2,8 +2,24 @@ import { SELF, env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { storeStub } from '../src/stub';
-import { BATCH_SIZE, RETRY_MS, STALE_MS, type PushStore } from '../src/store';
-import { b64urlDecode, b64urlEncode } from '../src/webpush';
+import {
+  BATCH_SIZE,
+  DAILY_PUSHES_UNPROVEN,
+  HEARTBEAT_MS,
+  IP_LIMITS,
+  IP_WINDOW_MS,
+  MAX_DEVICES,
+  PROTECT_MS,
+  PUSH_CONCURRENCY,
+  RETRY_MS,
+  STALE_MS,
+  TEST_BUCKET_SIZE,
+  TEST_REFILL_MS,
+  payloadFor,
+  type PushStore,
+  type ReminderRow,
+} from '../src/store';
+import { MAX_PLAINTEXT, b64urlDecode, b64urlEncode } from '../src/webpush';
 
 const ORIGIN = 'https://undeadcommander.github.io';
 const BASE = 'https://dosely-push.example.workers.dev/api';
@@ -81,8 +97,8 @@ function api(path: string, body?: unknown, init: RequestInit & { origin?: string
   });
 }
 
-async function apiJson(path: string, body?: unknown) {
-  const res = await api(path, body);
+async function apiJson(path: string, body?: unknown, init?: RequestInit & { origin?: string | null }) {
+  const res = await api(path, body, init);
   return { status: res.status, data: (await res.json()) as Record<string, unknown> };
 }
 
@@ -132,8 +148,10 @@ beforeEach(async () => {
     sent.push({ url: req.url, headers: req.headers, body: new Uint8Array(await req.arrayBuffer()) });
     return new Response(null, { status: pushStatus(req) });
   });
-  await runInDurableObject(stub(), async (_i, state) => {
-    state.storage.sql.exec('DELETE FROM devices; DELETE FROM reminders; DELETE FROM sent;');
+  await runInDurableObject(stub(), async (instance, state) => {
+    state.storage.sql.exec('DELETE FROM devices; DELETE FROM reminders; DELETE FROM sent; DELETE FROM meta;');
+    instance.resetRateLimits();
+    (instance as unknown as { vapidLoad: unknown }).vapidLoad = null;
     await state.storage.deleteAlarm();
   });
 });
@@ -149,9 +167,43 @@ describe('HTTP API', () => {
   it('serves health and the VAPID public key', async () => {
     const h = await apiJson('health');
     expect(h.status).toBe(200);
-    expect(h.data).toMatchObject({ ok: true, devices: 0 });
+    expect(Object.keys(h.data).sort()).toEqual(['devices', 'ok', 'push', 'time']);
+    expect(h.data).toMatchObject({ ok: true, devices: 0, push: 'ready' });
+    expect(typeof h.data.time).toBe('string');
     const k = await apiJson('push/public-key');
     expect(k).toEqual({ status: 200, data: { publicKey: env.VAPID_PUBLIC_KEY } });
+  });
+
+  it('reports misconfigured VAPID on health, public-key, push/test, and alarm without dropping devices', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const at = T0 + 60_000;
+    await apiJson('push/reminders', { deviceId: id, reminders: [reminder('m1', at)] });
+
+    await runInDurableObject(stub(), (instance) => {
+      (instance as unknown as { vapidLoad: unknown }).vapidLoad = Promise.resolve({
+        ok: false,
+        problem: 'VAPID_SUBJECT must be a mailto: address',
+      });
+    });
+
+    expect(await apiJson('push/public-key')).toEqual({ status: 503, data: { error: 'push not configured' } });
+    const h = await apiJson('health');
+    expect(h.status).toBe(503);
+    expect(h.data).toMatchObject({
+      ok: false,
+      push: 'misconfigured',
+      problem: 'VAPID_SUBJECT must be a mailto: address',
+      devices: 1,
+    });
+    expect(await apiJson('push/test', { deviceId: id })).toEqual({ status: 503, data: { error: 'push not configured' } });
+
+    setNow(at + 1000);
+    await fireAlarm();
+    expect(sent).toHaveLength(0);
+    expect((await apiJson('health')).data.devices).toBe(1);
+    expect(await queued(id)).toHaveLength(1);
+    expect(await alarmTime()).toBeGreaterThanOrEqual(at + 1000 + 60_000);
   });
 
   it('sets CORS headers only for allowed origins, and security headers always', async () => {
@@ -250,6 +302,67 @@ describe('HTTP API', () => {
       expect(r, endpoint).toEqual({ status: 400, data: { error } });
     }
   });
+  it('validates subscription keys, normalises padded/standard base64, and bumps rev only on change', async () => {
+    const id = deviceId();
+    let sub = await makeSubscriber();
+    // Pick a generated P-256 key whose standard base64 representation includes '+' or '/' and '=' padding.
+    while (!/[+/]/.test(sub.json.keys.p256dh.replace(/-/g, '+').replace(/_/g, '/'))) {
+      sub = await makeSubscriber();
+    }
+    const toStd = (b64u: string) => {
+      const s = b64u.replace(/-/g, '+').replace(/_/g, '/');
+      return s + '='.repeat((4 - (s.length % 4)) % 4);
+    };
+
+    for (const badKeys of [
+      { p256dh: b64urlEncode(new Uint8Array(64)), auth: sub.json.keys.auth },
+      { p256dh: sub.json.keys.p256dh, auth: b64urlEncode(new Uint8Array(8)) },
+      { p256dh: b64urlEncode(new Uint8Array([4, ...new Array(64).fill(0)])), auth: sub.json.keys.auth },
+    ]) {
+      const r = await apiJson('push/subscribe', { deviceId: id, subscription: { ...sub.json, keys: badKeys } });
+      expect(r).toEqual({ status: 400, data: { error: 'invalid subscription keys' } });
+    }
+
+    const stdSub = {
+      ...sub.json,
+      keys: { p256dh: toStd(sub.json.keys.p256dh), auth: toStd(sub.json.keys.auth) },
+    };
+    expect(stdSub.keys.p256dh).toMatch(/[+/]/);
+    expect(stdSub.keys.p256dh).toMatch(/=$/);
+    expect(await apiJson('push/subscribe', { deviceId: id, subscription: stdSub })).toEqual({
+      status: 200,
+      data: { ok: true },
+    });
+
+    const row1 = await runInDurableObject(stub(), (_i, state) =>
+      state.storage.sql.exec<{ p256dh: string; auth: string; rev: number }>('SELECT p256dh, auth, rev FROM devices WHERE device_id = ?', id).one(),
+    );
+    expect(row1).toEqual({ p256dh: sub.json.keys.p256dh, auth: sub.json.keys.auth, rev: 1 });
+    expect(row1.p256dh).not.toMatch(/[+/=]/);
+    expect(row1.auth).not.toMatch(/[+/=]/);
+
+    // Identical re-subscribe keeps rev unchanged.
+    expect(await apiJson('push/subscribe', { deviceId: id, subscription: sub.json })).toEqual({
+      status: 200,
+      data: { ok: true },
+    });
+    const revAfterSame = await runInDurableObject(stub(), (_i, state) =>
+      state.storage.sql.exec<{ rev: number }>('SELECT rev FROM devices WHERE device_id = ?', id).one().rev,
+    );
+    expect(revAfterSame).toBe(1);
+
+    // Changed endpoint bumps rev.
+    expect(
+      await apiJson('push/subscribe', {
+        deviceId: id,
+        subscription: { ...sub.json, endpoint: `${sub.endpoint}/v2` },
+      }),
+    ).toEqual({ status: 200, data: { ok: true } });
+    const revAfterEndpointChange = await runInDurableObject(stub(), (_i, state) =>
+      state.storage.sql.exec<{ rev: number }>('SELECT rev FROM devices WHERE device_id = ?', id).one().rev,
+    );
+    expect(revAfterEndpointChange).toBe(2);
+  });
 });
 
 describe('scheduling and delivery', () => {
@@ -277,13 +390,28 @@ describe('scheduling and delivery', () => {
     ) as Record<string, unknown>;
     expect(claims).toMatchObject({ aud: 'https://fcm.googleapis.com', sub: 'mailto:test@example.org' });
 
-    // The payload public/sw.js expects (same as server/index.ts payloadFor).
-    expect(await decryptPush(msg.body, sub)).toEqual({
-      title: 'Take Aspirin',
-      body: '100 mg tablet',
+    // The payload public/sw.js expects: always discreet server-generated text.
+    const decrypted = await decryptPush(msg.body, sub);
+    expect(decrypted).toEqual({
+      title: 'Time for your medication',
+      body: 'Open Dosely to review your dose.',
       tag: r.id,
-      data: { medId: 'med1', scheduledFor: new Date(at).toISOString(), reminderId: r.id, deviceId: id, reminder: r },
+      data: {
+        medId: 'med1',
+        scheduledFor: new Date(at).toISOString(),
+        reminderId: r.id,
+        deviceId: id,
+        reminder: {
+          id: r.id,
+          medId: 'med1',
+          at,
+          title: 'Time for your medication',
+          body: 'Open Dosely to review your dose.',
+        },
+      },
     });
+    expect(JSON.stringify(decrypted)).not.toContain('Take Aspirin');
+    expect(JSON.stringify(decrypted)).not.toContain('100 mg tablet');
     expect(await queued(id)).toEqual([]);
     expect(await alarmTime()).toBeNull();
 
@@ -337,9 +465,25 @@ describe('scheduling and delivery', () => {
     setNow(T0 + 1000 + 10 * 60_000);
     await fireAlarm();
     expect(sent).toHaveLength(1);
-    const payload = (await decryptPush(sent[0].body, sub)) as { tag: string; data: Record<string, unknown> };
+    const payload = (await decryptPush(sent[0].body, sub)) as { title: string; body: string; tag: string; data: Record<string, unknown> };
+    expect(payload.title).toBe('Time for your medication');
+    expect(payload.body).toBe('Open Dosely to review your dose.');
     expect(payload.tag).toBe(orig.id);
-    expect(payload.data).toMatchObject({ reminderId: orig.id, scheduledFor: new Date(orig.at).toISOString(), reminder: orig });
+    expect(payload.data).toEqual({
+      medId: 'med1',
+      reminderId: orig.id,
+      scheduledFor: new Date(orig.at).toISOString(),
+      deviceId: id,
+      reminder: {
+        id: orig.id,
+        medId: 'med1',
+        at: orig.at,
+        title: 'Time for your medication',
+        body: 'Open Dosely to review your dose.',
+      },
+    });
+    expect(JSON.stringify(payload)).not.toContain('Take Aspirin');
+    expect(JSON.stringify(payload)).not.toContain('100 mg');
     expect((await apiJson('push/snooze', { deviceId: deviceId(), reminder: orig, minutes: 10 })).status).toBe(404);
   });
 
@@ -393,6 +537,49 @@ describe('scheduling and delivery', () => {
     expect(await queued(id)).toEqual([]);
   });
 
+  it('keeps device on 401/403/301 and backs off retries on repeated 503s (20s, 40s, 80s)', async () => {
+    let now = T0;
+    for (const status of [401, 403, 301]) {
+      const idCase = deviceId();
+      await subscribe(idCase, await makeSubscriber());
+      const caseAt = now + 2000;
+      const sync = await apiJson('push/reminders', { deviceId: idCase, reminders: [reminder('m', caseAt)] });
+      expect(sync).toEqual({ status: 200, data: { ok: true, count: 1 } });
+      pushStatus = () => status;
+      now = caseAt;
+      setNow(now);
+      await fireAlarm();
+      expect((await apiJson('health')).data.devices).toBe(1);
+      const rows = await queued(idCase);
+      expect(rows, `status=${status}`).toHaveLength(1);
+      expect(rows[0].due_at).toBe(caseAt + RETRY_MS);
+      await apiJson('push/unsubscribe', { deviceId: idCase });
+    }
+
+    // Repeated 503s double the delay: 20 s, 40 s, 80 s, incrementing tries.
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const at = now + 10_000;
+    await apiJson('push/reminders', { deviceId: id, reminders: [reminder('m', at)] });
+    pushStatus = () => 503;
+    now = at;
+    for (const [expectedTries, expectedDelta] of [
+      [1, RETRY_MS],
+      [2, RETRY_MS * 2],
+      [3, RETRY_MS * 4],
+    ] as const) {
+      setNow(now);
+      await fireAlarm();
+      const row = await runInDurableObject(stub(), (_i, state) =>
+        state.storage.sql.exec<{ due_at: number; tries: number }>('SELECT due_at, tries FROM reminders WHERE device_id = ?', id).one(),
+      );
+      expect(row.tries).toBe(expectedTries);
+      expect(row.due_at).toBe(now + expectedDelta);
+      now = row.due_at;
+    }
+    expect((await apiJson('health')).data.devices).toBe(1);
+  });
+
   it('a sync drops an overdue reminder waiting for a retry (as server/index.ts does)', async () => {
     const id = deviceId();
     await subscribe(id, await makeSubscriber());
@@ -428,13 +615,15 @@ describe('scheduling and delivery', () => {
     }
   });
 
-  it('unsubscribe removes the device and its queue', async () => {
+  it('unsubscribe removes the device, its queue, and clears the alarm', async () => {
     const id = deviceId();
     await subscribe(id, await makeSubscriber());
     await apiJson('push/reminders', { deviceId: id, reminders: [reminder('m', T0 + 1000)] });
+    expect(await alarmTime()).toBe(T0 + 1000);
     expect((await apiJson('push/unsubscribe', { deviceId: id })).data).toEqual({ ok: true });
     expect(await queued(id)).toEqual([]);
     expect((await apiJson('health')).data.devices).toBe(0);
+    expect(await alarmTime()).toBeNull();
   });
 
   it('re-subscribing keeps the queue and sends to the new endpoint', async () => {
@@ -446,7 +635,10 @@ describe('scheduling and delivery', () => {
     setNow(T0 + 1000);
     await fireAlarm();
     expect(sent.map((s) => s.url)).toEqual(['https://web.push.apple.com/fresh']);
-    expect(await decryptPush(sent[0].body, fresh)).toMatchObject({ title: 'Take Aspirin' });
+    expect(await decryptPush(sent[0].body, fresh)).toMatchObject({
+      title: 'Time for your medication',
+      body: 'Open Dosely to review your dose.',
+    });
   });
 
   it('the cron watchdog re-arms a lost alarm', async () => {
@@ -489,5 +681,805 @@ describe('/push/test', () => {
     expect(await apiJson('push/test', { deviceId: id })).toEqual({ status: 410, data: { error: 'subscription expired' } });
     expect((await apiJson('health')).data.devices).toBe(0);
     expect((await apiJson('push/test', { deviceId: id })).status).toBe(404);
+  });
+
+  it('keeps device on 403 and clears device + alarm on 404 when a reminder is queued', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    await apiJson('push/reminders', { deviceId: id, reminders: [reminder('m', T0 + 60_000)] });
+    expect(await alarmTime()).toBe(T0 + 60_000);
+
+    pushStatus = () => 403;
+    expect(await apiJson('push/test', { deviceId: id })).toEqual({
+      status: 502,
+      data: { error: 'push service rejected the message' },
+    });
+    expect((await apiJson('health')).data.devices).toBe(1);
+    expect(await alarmTime()).toBe(T0 + 60_000);
+
+    setNow(T0 + 6_000);
+    pushStatus = () => 404;
+    expect(await apiJson('push/test', { deviceId: id })).toEqual({
+      status: 410,
+      data: { error: 'subscription expired' },
+    });
+    expect((await apiJson('health')).data.devices).toBe(0);
+    expect(await alarmTime()).toBeNull();
+  });
+
+  it('enforces per-IP limits (IPv4 and IPv6 /64), global test bucket, and persisted per-device cooldown', async () => {
+    // 1. Per-IP subscribe limit (10 per window), separate IP allowed, IPv6 /64 shared bucket, window reset.
+    const sub = await makeSubscriber();
+    for (let i = 0; i < IP_LIMITS.subscribe; i++) {
+      const r = await apiJson(
+        'push/subscribe',
+        { deviceId: deviceId(), subscription: sub.json },
+        { headers: { 'CF-Connecting-IP': '203.0.113.7' } },
+      );
+      expect(r.status).toBe(200);
+    }
+    expect(
+      await apiJson(
+        'push/subscribe',
+        { deviceId: deviceId(), subscription: sub.json },
+        { headers: { 'CF-Connecting-IP': '203.0.113.7' } },
+      ),
+    ).toEqual({ status: 429, data: { error: 'slow down' } });
+    expect(
+      await apiJson(
+        'push/subscribe',
+        { deviceId: deviceId(), subscription: sub.json },
+        { headers: { 'CF-Connecting-IP': '203.0.113.8' } },
+      ),
+    ).toEqual({ status: 200, data: { ok: true } });
+
+    for (let i = 0; i < 6; i++) {
+      expect(
+        (
+          await apiJson(
+            'push/subscribe',
+            { deviceId: deviceId(), subscription: sub.json },
+            { headers: { 'CF-Connecting-IP': '2001:db8:1:2::1' } },
+          )
+        ).status,
+      ).toBe(200);
+    }
+    for (let i = 0; i < 4; i++) {
+      expect(
+        (
+          await apiJson(
+            'push/subscribe',
+            { deviceId: deviceId(), subscription: sub.json },
+            { headers: { 'CF-Connecting-IP': '2001:db8:1:2:ffff::9' } },
+          )
+        ).status,
+      ).toBe(200);
+    }
+    expect(
+      await apiJson(
+        'push/subscribe',
+        { deviceId: deviceId(), subscription: sub.json },
+        { headers: { 'CF-Connecting-IP': '2001:db8:1:2:ffff::9' } },
+      ),
+    ).toEqual({ status: 429, data: { error: 'slow down' } });
+
+    setNow(T0 + IP_WINDOW_MS);
+    expect(
+      (
+        await apiJson(
+          'push/subscribe',
+          { deviceId: deviceId(), subscription: sub.json },
+          { headers: { 'CF-Connecting-IP': '203.0.113.7' } },
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await apiJson(
+          'push/subscribe',
+          { deviceId: deviceId(), subscription: sub.json },
+          { headers: { 'CF-Connecting-IP': '2001:db8:1:2::1' } },
+        )
+      ).status,
+    ).toBe(200);
+
+    // 2. Per-IP push/test limit (6 per window) using distinct devices.
+    const testDevs: string[] = [];
+    for (let i = 0; i < IP_LIMITS.test + 1; i++) {
+      const id = deviceId();
+      await subscribe(id, sub);
+      testDevs.push(id);
+    }
+    for (let i = 0; i < IP_LIMITS.test; i++) {
+      expect(
+        await apiJson('push/test', { deviceId: testDevs[i] }, { headers: { 'CF-Connecting-IP': '198.51.100.42' } }),
+      ).toEqual({ status: 200, data: { ok: true } });
+    }
+    expect(
+      await apiJson('push/test', { deviceId: testDevs[IP_LIMITS.test] }, { headers: { 'CF-Connecting-IP': '198.51.100.42' } }),
+    ).toEqual({ status: 429, data: { error: 'slow down' } });
+
+    // Check persisted last_test column on the tested device.
+    const lastTest = await runInDurableObject(stub(), (_i, state) =>
+      state.storage.sql.exec<{ last_test: number | null }>('SELECT last_test FROM devices WHERE device_id = ?', testDevs[0]).one().last_test,
+    );
+    expect(lastTest).toBe(T0 + IP_WINDOW_MS);
+
+    // 3. Global test bucket (TEST_BUCKET_SIZE = 10) without IP header, refilling after TEST_REFILL_MS.
+    // Reset test_bucket in meta and subscribe fresh devices for a clean global bucket count.
+    await runInDurableObject(stub(), (i, state) => {
+      state.storage.sql.exec('DELETE FROM meta;');
+      i.resetRateLimits();
+    });
+    const bucketDevs: string[] = [];
+    for (let i = 0; i < TEST_BUCKET_SIZE + 2; i++) {
+      const id = deviceId();
+      await subscribe(id, sub);
+      bucketDevs.push(id);
+    }
+    for (let i = 0; i < TEST_BUCKET_SIZE; i++) {
+      expect(await apiJson('push/test', { deviceId: bucketDevs[i] })).toEqual({ status: 200, data: { ok: true } });
+    }
+    expect(await apiJson('push/test', { deviceId: bucketDevs[TEST_BUCKET_SIZE] })).toEqual({
+      status: 429,
+      data: { error: 'slow down' },
+    });
+    setNow(T0 + IP_WINDOW_MS + TEST_REFILL_MS);
+    expect(await apiJson('push/test', { deviceId: bucketDevs[TEST_BUCKET_SIZE + 1] })).toEqual({
+      status: 200,
+      data: { ok: true },
+    });
+  });
+});
+
+describe('eviction, heartbeat, concurrency, fairness, daily cap', () => {
+  async function insertDeviceRows(
+    rows: Array<{ id: string; updatedAt: number; lastOk: number | null }>,
+    sub: Subscriber,
+  ) {
+    await runInDurableObject(stub(), (_i, state) => {
+      for (const r of rows) {
+        state.storage.sql.exec(
+          `INSERT INTO devices (device_id, endpoint, p256dh, auth, expiration, rev, updated_at, created_at, last_ok, last_test, day, day_sends)
+           VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, NULL, 0, 0)`,
+          r.id,
+          `https://fcm.googleapis.com/fcm/send/${r.id}`,
+          sub.json.keys.p256dh,
+          sub.json.keys.auth,
+          r.updatedAt,
+          r.updatedAt,
+          r.lastOk,
+        );
+      }
+    });
+  }
+
+  async function deviceIds(): Promise<string[]> {
+    return runInDurableObject(stub(), (_i, state) =>
+      state.storage.sql.exec<{ device_id: string }>('SELECT device_id FROM devices').toArray().map((r) => r.device_id),
+    );
+  }
+
+  it(`evicts oldest unproven, unproven before proven, refuses full active proven, and evicts inactive > PROTECT_MS at MAX_DEVICES (${MAX_DEVICES})`, async () => {
+    const sub = await makeSubscriber();
+
+    // (a) All unproven: oldest updated_at is evicted.
+    await insertDeviceRows(
+      Array.from({ length: MAX_DEVICES }, (_, i) => ({
+        id: `unproven_${String(i).padStart(3, '0')}_xxxxxxxxxx`,
+        updatedAt: T0 - (i + 1) * 1000,
+        lastOk: null,
+      })),
+      sub,
+    );
+    const freshA = deviceId();
+    await subscribe(freshA, sub);
+    const idsA = await deviceIds();
+    expect(idsA).toHaveLength(MAX_DEVICES);
+    expect(idsA).not.toContain(`unproven_${String(MAX_DEVICES - 1).padStart(3, '0')}_xxxxxxxxxx`);
+    expect(idsA).toContain(freshA);
+
+    // (b) Unproven evicted before proven even if proven is older.
+    await runInDurableObject(stub(), (_i, state) => state.storage.sql.exec('DELETE FROM devices;'));
+    const provenOldId = 'proven_old_00000000000000';
+    const unprovenNewId = 'unproven_new_000000000000';
+    await insertDeviceRows(
+      [
+        { id: provenOldId, updatedAt: T0 - 10_000_000, lastOk: T0 - 10_000_000 },
+        { id: unprovenNewId, updatedAt: T0 - 1000, lastOk: null },
+        ...Array.from({ length: MAX_DEVICES - 2 }, (_, i) => ({
+          id: `proven_${String(i).padStart(3, '0')}_xxxxxxxxxxxx`,
+          updatedAt: T0 - 5000,
+          lastOk: T0 - 5000,
+        })),
+      ],
+      sub,
+    );
+    const freshB = deviceId();
+    await subscribe(freshB, sub);
+    const idsB = await deviceIds();
+    expect(idsB).toHaveLength(MAX_DEVICES);
+    expect(idsB).not.toContain(unprovenNewId);
+    expect(idsB).toContain(provenOldId);
+    expect(idsB).toContain(freshB);
+
+    // (c) All 200 proven with recent activity -> 503 server full; existing device re-subscribing succeeds.
+    await runInDurableObject(stub(), (_i, state) => state.storage.sql.exec('DELETE FROM devices;'));
+    const fullIds = Array.from({ length: MAX_DEVICES }, (_, i) => `active_${String(i).padStart(3, '0')}_xxxxxxxxxxxx`);
+    await insertDeviceRows(
+      fullIds.map((id, i) => ({ id, updatedAt: T0 - (i + 1) * 1000, lastOk: T0 - (i + 1) * 1000 })),
+      sub,
+    );
+    expect(await apiJson('push/subscribe', { deviceId: deviceId(), subscription: sub.json })).toEqual({
+      status: 503,
+      data: { error: 'server full' },
+    });
+    expect(
+      await apiJson('push/subscribe', {
+        deviceId: fullIds[0],
+        subscription: { ...sub.json, endpoint: 'https://web.push.apple.com/reused' },
+      }),
+    ).toEqual({ status: 200, data: { ok: true } });
+
+    // (d) All proven, one inactive > PROTECT_MS -> that one is evicted.
+    const staleId = fullIds[MAX_DEVICES - 1];
+    await runInDurableObject(stub(), (_i, state) => {
+      state.storage.sql.exec('UPDATE devices SET updated_at = ?, last_ok = ? WHERE device_id = ?', T0 - PROTECT_MS - 1, T0 - PROTECT_MS - 1, staleId);
+    });
+    const freshD = deviceId();
+    await subscribe(freshD, sub);
+    const idsD = await deviceIds();
+    expect(idsD).toHaveLength(MAX_DEVICES);
+    expect(idsD).not.toContain(staleId);
+    expect(idsD).toContain(freshD);
+  });
+
+  it('refreshes devices.updated_at only after HEARTBEAT_MS on no-op sync, or immediately on change', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const r1 = reminder('m1', T0 + 2 * HEARTBEAT_MS);
+    const r2 = reminder('m2', T0 + 3 * HEARTBEAT_MS);
+    await apiJson('push/reminders', { deviceId: id, reminders: [r1] });
+
+    const getUpdatedAt = () =>
+      runInDurableObject(stub(), (_i, state) =>
+        state.storage.sql.exec<{ updated_at: number }>('SELECT updated_at FROM devices WHERE device_id = ?', id).one().updated_at,
+      );
+
+    expect(await getUpdatedAt()).toBe(T0);
+
+    setNow(T0 + HEARTBEAT_MS - 1000);
+    await apiJson('push/reminders', { deviceId: id, reminders: [r1] });
+    expect(await getUpdatedAt()).toBe(T0);
+
+    setNow(T0 + HEARTBEAT_MS);
+    await apiJson('push/reminders', { deviceId: id, reminders: [r1] });
+    expect(await getUpdatedAt()).toBe(T0 + HEARTBEAT_MS);
+
+    setNow(T0 + HEARTBEAT_MS + 1000);
+    await apiJson('push/reminders', { deviceId: id, reminders: [r1, r2] });
+    expect(await getUpdatedAt()).toBe(T0 + HEARTBEAT_MS + 1000);
+  });
+
+  it(`sends devices concurrently (<= PUSH_CONCURRENCY=${PUSH_CONCURRENCY}), does not block B/C on A, and skips rest on 410`, async () => {
+    const subA = await makeSubscriber('https://fcm.googleapis.com/fcm/send/dev-a');
+    const subB = await makeSubscriber('https://fcm.googleapis.com/fcm/send/dev-b');
+    const subC = await makeSubscriber('https://fcm.googleapis.com/fcm/send/dev-c');
+    const idA = deviceId();
+    const idB = deviceId();
+    const idC = deviceId();
+    await subscribe(idA, subA);
+    await subscribe(idB, subB);
+    await subscribe(idC, subC);
+    const due = T0 + 1000;
+    await apiJson('push/reminders', { deviceId: idA, reminders: [reminder('m', due)] });
+    await apiJson('push/reminders', { deviceId: idB, reminders: [reminder('m', due)] });
+    await apiJson('push/reminders', { deviceId: idC, reminders: [reminder('m', due)] });
+
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const sentUrls: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      sentUrls.push(url);
+      if (url === subA.endpoint) await gateA;
+      return new Response(null, { status: 201 });
+    });
+
+    setNow(due);
+    const alarmPromise = fireAlarm();
+    await vi.waitFor(() => {
+      expect(sentUrls).toContain(subB.endpoint);
+      expect(sentUrls).toContain(subC.endpoint);
+    });
+    releaseA();
+    await alarmPromise;
+    expect(sentUrls).toContain(subA.endpoint);
+
+    // Clear and test 10 devices due at once: max in-flight <= PUSH_CONCURRENCY (6).
+    await runInDurableObject(stub(), async (instance, state) => {
+      state.storage.sql.exec('DELETE FROM devices; DELETE FROM reminders; DELETE FROM sent;');
+      instance.resetRateLimits();
+      await state.storage.deleteAlarm();
+    });
+
+    const ten = await Promise.all(
+      Array.from({ length: 10 }, async (_, i) => ({
+        id: deviceId(),
+        sub: await makeSubscriber(`https://fcm.googleapis.com/fcm/send/conc-${i}`),
+      })),
+    );
+    for (const d of ten) {
+      await subscribe(d.id, d.sub);
+      await apiJson('push/reminders', { deviceId: d.id, reminders: [reminder('m', due + 1000)] });
+    }
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 15));
+      inFlight--;
+      return new Response(null, { status: 201 });
+    });
+    setNow(due + 1000);
+    await fireAlarm();
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(PUSH_CONCURRENCY);
+
+    // 410 on one device skips its remaining reminders in the same run while still sending other devices.
+    const goneId = deviceId();
+    const okId = deviceId();
+    const goneSub = await makeSubscriber('https://fcm.googleapis.com/fcm/send/gone-multi');
+    const okSub = await makeSubscriber('https://fcm.googleapis.com/fcm/send/ok-other');
+    await subscribe(goneId, goneSub);
+    await subscribe(okId, okSub);
+    await apiJson('push/reminders', {
+      deviceId: goneId,
+      reminders: [reminder('m1', due + 2000), reminder('m2', due + 2001)],
+    });
+    await apiJson('push/reminders', { deviceId: okId, reminders: [reminder('m1', due + 2000)] });
+
+    const seenByUrl: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      seenByUrl.push(url);
+      return new Response(null, { status: url === goneSub.endpoint ? 410 : 201 });
+    });
+    setNow(due + 2001);
+    await fireAlarm();
+    expect(seenByUrl.filter((u) => u === goneSub.endpoint)).toHaveLength(1);
+    expect(seenByUrl.filter((u) => u === okSub.endpoint)).toHaveLength(1);
+    expect(await queued(goneId)).toEqual([]);
+    expect(await queued(okId)).toEqual([]);
+  });
+
+  it('fairness: serves device Y in the first alarm run even when device X has 50 earlier reminders', async () => {
+    const idX = deviceId();
+    const idY = deviceId();
+    const subX = await makeSubscriber('https://fcm.googleapis.com/fcm/send/fair-x');
+    const subY = await makeSubscriber('https://fcm.googleapis.com/fcm/send/fair-y');
+    await subscribe(idX, subX);
+    await subscribe(idY, subY);
+
+    const T = T0 + 10_000;
+    await apiJson('push/reminders', {
+      deviceId: idX,
+      reminders: Array.from({ length: 50 }, (_, i) => reminder(`mx${i}`, T)),
+    });
+    await apiJson('push/reminders', {
+      deviceId: idY,
+      reminders: [reminder('my', T + 1)],
+    });
+
+    setNow(T + 1);
+    await fireAlarm();
+    expect(sent.map((s) => s.url)).toContain(subY.endpoint);
+    expect(sent).toHaveLength(BATCH_SIZE);
+  });
+
+  it(`caps unproven devices at DAILY_PUSHES_UNPROVEN (${DAILY_PUSHES_UNPROVEN}) attempts per UTC day and drops remaining due reminders`, async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const due = T0 + 60_000;
+    await apiJson('push/reminders', {
+      deviceId: id,
+      reminders: Array.from({ length: 25 }, (_, i) => reminder(`m${i}`, due)),
+    });
+
+    pushStatus = () => 500;
+    let now = due;
+    setNow(now);
+    let loops = 0;
+    while (await fireAlarm()) {
+      loops++;
+      if (loops > 20) throw new Error('alarm loop did not terminate');
+      const next = await alarmTime();
+      if (next !== null && next > now) {
+        now = next;
+        setNow(now);
+      }
+    }
+
+    expect(sent).toHaveLength(DAILY_PUSHES_UNPROVEN);
+    expect(await queued(id)).toEqual([]);
+    expect(await alarmTime()).toBeNull();
+  });
+});
+
+describe('validation, grouping, group snooze, and payload size', () => {
+  it('validates medId control chars and reminder doses constraints', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const at = T0 + 60_000;
+
+    expect(
+      await apiJson('push/reminders', {
+        deviceId: id,
+        reminders: [{ ...reminder('m0', at), medId: 'bad\u0007med' }],
+      }),
+    ).toEqual({ status: 400, data: { error: 'invalid medId' } });
+
+    const twentyOne = Array.from({ length: 21 }, (_, i) => ({ medId: `m${i}`, at: at + i * 1000 }));
+    expect(
+      await apiJson('push/reminders', {
+        deviceId: id,
+        reminders: [{ ...reminder('m0', at), doses: twentyOne }],
+      }),
+    ).toEqual({ status: 400, data: { error: 'invalid reminder doses' } });
+
+    expect(
+      await apiJson('push/reminders', {
+        deviceId: id,
+        reminders: [{ ...reminder('m0', at), doses: [{ medId: 'm0', at }, { medId: 'm0', at }] }],
+      }),
+    ).toEqual({ status: 400, data: { error: 'invalid reminder doses' } });
+
+    expect(
+      await apiJson('push/reminders', {
+        deviceId: id,
+        reminders: [{ ...reminder('m0', at), doses: [{ medId: 'm0', at: at - 1 }, { medId: 'm1', at }] }],
+      }),
+    ).toEqual({ status: 400, data: { error: 'invalid reminder doses' } });
+
+    expect(
+      await apiJson('push/reminders', {
+        deviceId: id,
+        reminders: [{ ...reminder('m0', at), doses: [{ medId: 'm0', at }] }],
+      }),
+    ).toEqual({ status: 200, data: { ok: true, count: 1 } });
+
+    const stored = await runInDurableObject(stub(), (_i, state) =>
+      state.storage.sql.exec<{ doses: string | null }>('SELECT doses FROM reminders WHERE device_id = ?', id).one(),
+    );
+    expect(stored.doses).toBeNull();
+  });
+
+  it('sends group reminders, strips already-notified doses from shifted groups, and deduplicates singles', async () => {
+    const id = deviceId();
+    const sub = await makeSubscriber();
+    await subscribe(id, sub);
+
+    const T1 = T0 + 60_000;
+    const T2 = T1 + 5 * 60_000;
+    const T3 = T1 + 12 * 60_000;
+    const group1 = {
+      id: `a@${T1}`,
+      medId: 'a',
+      at: T1,
+      title: 'x',
+      body: 'y',
+      doses: [
+        { medId: 'a', at: T1 },
+        { medId: 'b', at: T2 },
+      ],
+    };
+    expect(await apiJson('push/reminders', { deviceId: id, reminders: [group1] })).toEqual({
+      status: 200,
+      data: { ok: true, count: 1 },
+    });
+
+    setNow(T1);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    expect(await decryptPush(sent[0].body, sub)).toEqual({
+      title: 'Time for your medications',
+      body: '2 medications are due. Open Dosely to review them.',
+      tag: `a@${T1}`,
+      count: 2,
+      data: {
+        medId: 'a',
+        scheduledFor: new Date(T1).toISOString(),
+        reminderId: `a@${T1}`,
+        deviceId: id,
+        count: 2,
+        reminder: {
+          id: `a@${T1}`,
+          medId: 'a',
+          at: T1,
+          title: 'Time for your medications',
+          body: '2 medications are due. Open Dosely to review them.',
+          doses: [
+            { medId: 'a', at: T1 },
+            { medId: 'b', at: T2 },
+          ],
+        },
+      },
+    });
+
+    // At T1 + 1 min, client posts shifted group [b@T2, c@T3] -> b stripped, c@T3 queued as single.
+    setNow(T1 + 60_000);
+    const shifted = await apiJson('push/reminders', {
+      deviceId: id,
+      reminders: [
+        {
+          id: `b@${T2}`,
+          medId: 'b',
+          at: T2,
+          title: 'x',
+          body: 'y',
+          doses: [
+            { medId: 'b', at: T2 },
+            { medId: 'c', at: T3 },
+          ],
+        },
+      ],
+    });
+    expect(shifted).toEqual({ status: 200, data: { ok: true, count: 1 } });
+    expect((await queued(id)).map((r) => ({ id: r.id, at: r.at }))).toEqual([{ id: `c@${T3}`, at: T3 }]);
+
+    // Re-posting single b@T2 while T2 is still in the future -> stripped by sent table (count 0).
+    expect(await apiJson('push/reminders', { deviceId: id, reminders: [reminder('b', T2)] })).toEqual({
+      status: 200,
+      data: { ok: true, count: 0 },
+    });
+
+    // Re-queue c@T3 and let it fire at T3 as single-dose text.
+    await apiJson('push/reminders', { deviceId: id, reminders: [reminder('c', T3)] });
+    setNow(T3);
+    await fireAlarm();
+    expect(sent).toHaveLength(2);
+    expect(await decryptPush(sent[1].body, sub)).toEqual({
+      title: 'Time for your medication',
+      body: 'Open Dosely to review your dose.',
+      tag: `c@${T3}`,
+      data: {
+        medId: 'c',
+        scheduledFor: new Date(T3).toISOString(),
+        reminderId: `c@${T3}`,
+        deviceId: id,
+        reminder: {
+          id: `c@${T3}`,
+          medId: 'c',
+          at: T3,
+          title: 'Time for your medication',
+          body: 'Open Dosely to review your dose.',
+        },
+      },
+    });
+  });
+
+  it('group snooze: fires as group, shrinks when one dose is dismissed, and drops when both dismissed', async () => {
+    const id = deviceId();
+    const sub = await makeSubscriber();
+    await subscribe(id, sub);
+
+    const T1 = T0 - 60_000;
+    const T2 = T1 + 5 * 60_000;
+    const orig = {
+      id: `a@${T1}`,
+      medId: 'a',
+      at: T1,
+      title: 'x',
+      body: 'y',
+      doses: [
+        { medId: 'a', at: T1 },
+        { medId: 'b', at: T2 },
+      ],
+    };
+    const s1 = await apiJson('push/snooze', { deviceId: id, reminder: orig, minutes: 10 });
+    expect(s1).toEqual({ status: 200, data: { ok: true, at: T0 + 10 * 60_000 } });
+
+    setNow(T0 + 10 * 60_000);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    expect(await decryptPush(sent[0].body, sub)).toEqual({
+      title: 'Time for your medications',
+      body: '2 medications are due. Open Dosely to review them.',
+      tag: orig.id,
+      count: 2,
+      data: {
+        medId: 'a',
+        scheduledFor: new Date(T1).toISOString(),
+        reminderId: orig.id,
+        deviceId: id,
+        count: 2,
+        reminder: {
+          id: orig.id,
+          medId: 'a',
+          at: T1,
+          title: 'Time for your medications',
+          body: '2 medications are due. Open Dosely to review them.',
+          doses: orig.doses,
+        },
+      },
+    });
+
+    // Snooze again, then dismiss a@T1 -> shrinks to single-dose text for b.
+    await apiJson('push/snooze', { deviceId: id, reminder: orig, minutes: 10 });
+    const futureA = reminder('a', T0 + 6 * 3600_000);
+    const futureB = reminder('b', T0 + 6 * 3600_000);
+    await apiJson('push/reminders', { deviceId: id, reminders: [futureA, futureB], dismissed: [orig.id] });
+    const snoozedAfterPartial = (await queued(id)).filter((r) => r.snoozed);
+    expect(snoozedAfterPartial).toHaveLength(1);
+
+    setNow(T0 + 20 * 60_000);
+    await fireAlarm();
+    expect(sent).toHaveLength(2);
+    expect(await decryptPush(sent[1].body, sub)).toEqual({
+      title: 'Time for your medication',
+      body: 'Open Dosely to review your dose.',
+      tag: `b@${T2}`,
+      data: {
+        medId: 'b',
+        scheduledFor: new Date(T2).toISOString(),
+        reminderId: `b@${T2}`,
+        deviceId: id,
+        reminder: {
+          id: `b@${T2}`,
+          medId: 'b',
+          at: T2,
+          title: 'Time for your medication',
+          body: 'Open Dosely to review your dose.',
+        },
+      },
+    });
+
+    // Snooze again, then dismiss both -> pending snooze removed.
+    await apiJson('push/snooze', { deviceId: id, reminder: orig, minutes: 10 });
+    await apiJson('push/reminders', {
+      deviceId: id,
+      reminders: [futureA, futureB],
+      dismissed: [orig.id, `b@${T2}`],
+    });
+    expect((await queued(id)).filter((r) => r.snoozed)).toHaveLength(0);
+  });
+
+  it('bounds multibyte 20-dose group payload to <= MAX_PLAINTEXT UTF-8 bytes and tests payloadFor directly', async () => {
+    const id = deviceId();
+    const sub = await makeSubscriber();
+    await subscribe(id, sub);
+
+    const T1 = T0 + 60_000;
+    const doses = Array.from({ length: 20 }, (_, i) => ({
+      medId: `${String(i).padStart(2, '0')}${'日'.repeat(98)}`,
+      at: T1 + i * 1000,
+    }));
+    const bigGroup = {
+      id: `${doses[0].medId}@${T1}`,
+      medId: doses[0].medId,
+      at: T1,
+      title: 'ignored',
+      body: 'ignored',
+      doses,
+    };
+    expect(await apiJson('push/reminders', { deviceId: id, reminders: [bigGroup] })).toEqual({
+      status: 200,
+      data: { ok: true, count: 1 },
+    });
+
+    setNow(T1);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    const decrypted = (await decryptPush(sent[0].body, sub)) as {
+      count: number;
+      data: { count: number; reminder: { doses: unknown[] } };
+    };
+    expect(decrypted.count).toBe(20);
+    expect(decrypted.data.count).toBe(20);
+    expect(decrypted.data.reminder.doses.length).toBeLessThan(20);
+    expect(new TextEncoder().encode(JSON.stringify(decrypted)).length).toBeLessThanOrEqual(MAX_PLAINTEXT);
+
+    // Direct payloadFor checks for a single row and a group row.
+    const singleRow: ReminderRow = {
+      device_id: id,
+      id: `m1@${T1}`,
+      med_id: 'm1',
+      at: T1,
+      doses: null,
+      snoozed: 0,
+      orig_id: null,
+      orig_at: null,
+    };
+    expect(JSON.parse(payloadFor(id, singleRow))).toEqual({
+      title: 'Time for your medication',
+      body: 'Open Dosely to review your dose.',
+      tag: `m1@${T1}`,
+      data: {
+        medId: 'm1',
+        scheduledFor: new Date(T1).toISOString(),
+        reminderId: `m1@${T1}`,
+        deviceId: id,
+        reminder: {
+          id: `m1@${T1}`,
+          medId: 'm1',
+          at: T1,
+          title: 'Time for your medication',
+          body: 'Open Dosely to review your dose.',
+        },
+      },
+    });
+
+    const groupRow: ReminderRow = {
+      device_id: id,
+      id: bigGroup.id,
+      med_id: bigGroup.medId,
+      at: T1,
+      doses: JSON.stringify(doses.map((d) => [d.medId, d.at])),
+      snoozed: 0,
+      orig_id: null,
+      orig_at: null,
+    };
+    const groupPayload = payloadFor(id, groupRow);
+    expect(new TextEncoder().encode(groupPayload).length).toBeLessThanOrEqual(MAX_PLAINTEXT);
+    expect(JSON.parse(groupPayload)).toMatchObject({
+      title: 'Time for your medications',
+      body: '20 medications are due. Open Dosely to review them.',
+      tag: bigGroup.id,
+      count: 20,
+    });
+  });
+});
+
+describe('snooze race', () => {
+  it('a sync landing after a snooze came due (before the alarm ran) keeps it', async () => {
+    const id = deviceId();
+    const sub = await makeSubscriber();
+    await subscribe(id, sub);
+    const orig = reminder('med1', T0 - 60_000);
+    const future = reminder('med1', T0 + 6 * 3600_000);
+    await apiJson('push/snooze', { deviceId: id, reminder: orig, minutes: 10 });
+    setNow(T0 + 10 * 60_000 + 500); // due, alarm not yet run
+    await apiJson('push/reminders', { deviceId: id, reminders: [future], dismissed: [] });
+    expect((await queued(id)).filter((r) => r.snoozed)).toHaveLength(1);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    expect(((await decryptPush(sent[0].body, sub)) as { tag: string }).tag).toBe(orig.id);
+  });
+});
+
+describe('alarm writes', () => {
+  async function spyAlarmWrites() {
+    return runInDurableObject(stub(), (_i, state) => ({
+      set: vi.spyOn(state.storage, 'setAlarm'),
+      del: vi.spyOn(state.storage, 'deleteAlarm'),
+    }));
+  }
+
+  it('the idle watchdog (nothing queued, no alarm) writes nothing', async () => {
+    const spies = await spyAlarmWrites();
+    const waitUntil = vi.fn<(p: Promise<unknown>) => void>();
+    const ctx = { waitUntil, passThroughOnException: () => {}, props: {} } as unknown as ExecutionContext;
+    await worker.scheduled({ cron: '* * * * *', scheduledTime: Date.now(), noRetry: () => {} }, env, ctx);
+    await Promise.all(waitUntil.mock.calls.map(([p]) => p));
+    expect(spies.set).not.toHaveBeenCalled();
+    expect(spies.del).not.toHaveBeenCalled();
+    expect(await alarmTime()).toBeNull();
+  });
+
+  it('a no-op sync does not set the alarm again', async () => {
+    const id = deviceId();
+    await subscribe(id, await makeSubscriber());
+    const list = [reminder('m', T0 + 60_000)];
+    const spies = await spyAlarmWrites();
+    await apiJson('push/reminders', { deviceId: id, reminders: list });
+    expect(await alarmTime()).toBe(T0 + 60_000);
+    expect(spies.set).toHaveBeenCalledTimes(1); // the spies do see the object's writes
+    spies.set.mockClear();
+    await apiJson('push/reminders', { deviceId: id, reminders: list });
+    expect(spies.set).not.toHaveBeenCalled();
+    expect(spies.del).not.toHaveBeenCalled();
   });
 });

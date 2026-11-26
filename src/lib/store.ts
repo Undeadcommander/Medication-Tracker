@@ -740,27 +740,3 @@ export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: 
     getData,
   };
 }
-
-/** Per-device preferences that aren't part of the exported data. */
-export interface Prefs {
-  discreetNotifications: boolean;
-}
-
-const PREFS_KEY = 'medtracker.prefs';
-
-export function loadPrefs(): Prefs {
-  try {
-    const p = JSON.parse(localStorage.getItem(PREFS_KEY) ?? '{}');
-    return { discreetNotifications: p.discreetNotifications === true };
-  } catch {
-    return { discreetNotifications: false };
-  }
-}
-
-export function savePrefs(p: Prefs) {
-  try {
-    localStorage.setItem(PREFS_KEY, JSON.stringify(p));
-  } catch {
-    /* ignore */
-  }
-}

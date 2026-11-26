@@ -50,6 +50,49 @@ export interface SubscriptionKeys {
   auth: string;
 }
 
+/** The subscription's keys can never work (bad length, not a P-256 point): the device is unusable. */
+export class SubscriptionKeyError extends Error {}
+
+/** The message is too big to encrypt into one record (retrying can't help). */
+export class PayloadTooLargeError extends Error {
+  constructor(size: number) {
+    super(`payload too large (${size} > ${MAX_PLAINTEXT})`);
+  }
+}
+
+async function importSubscriptionKeys(keys: SubscriptionKeys) {
+  let uaPublic: Uint8Array<ArrayBuffer>;
+  let authSecret: Uint8Array<ArrayBuffer>;
+  try {
+    uaPublic = b64urlDecode(keys.p256dh);
+    authSecret = b64urlDecode(keys.auth);
+  } catch {
+    throw new SubscriptionKeyError('subscription keys are not base64url');
+  }
+  if (uaPublic.length !== 65 || uaPublic[0] !== 4) throw new SubscriptionKeyError('invalid p256dh key');
+  if (authSecret.length !== 16) throw new SubscriptionKeyError('invalid auth secret');
+  let uaKey: CryptoKey;
+  try {
+    uaKey = await crypto.subtle.importKey('raw', uaPublic, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  } catch {
+    throw new SubscriptionKeyError('p256dh is not a P-256 point');
+  }
+  return { uaPublic, authSecret, uaKey };
+}
+
+/**
+ * Checks a subscription's keys the way encryption will use them (65-byte uncompressed P-256
+ * point, 16-byte auth secret) and returns them as unpadded base64url, or null if they can't work.
+ */
+export async function normaliseSubscriptionKeys(keys: SubscriptionKeys): Promise<SubscriptionKeys | null> {
+  try {
+    const { uaPublic, authSecret } = await importSubscriptionKeys(keys);
+    return { p256dh: b64urlEncode(uaPublic), auth: b64urlEncode(authSecret) };
+  } catch {
+    return null;
+  }
+}
+
 /** Test hook: fixed sender key pair and salt instead of random ones. */
 export interface EncryptOverrides {
   senderKeys?: CryptoKeyPair;
@@ -62,13 +105,8 @@ export async function encryptPayload(
   plaintext: Uint8Array<ArrayBuffer>,
   overrides: EncryptOverrides = {},
 ): Promise<Uint8Array<ArrayBuffer>> {
-  if (plaintext.length > MAX_PLAINTEXT) throw new Error(`payload too large (${plaintext.length} > ${MAX_PLAINTEXT})`);
-  const uaPublic = b64urlDecode(keys.p256dh);
-  const authSecret = b64urlDecode(keys.auth);
-  if (uaPublic.length !== 65 || uaPublic[0] !== 4) throw new Error('invalid p256dh key');
-  if (authSecret.length < 16) throw new Error('invalid auth secret');
-
-  const uaKey = await crypto.subtle.importKey('raw', uaPublic, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  if (plaintext.length > MAX_PLAINTEXT) throw new PayloadTooLargeError(plaintext.length);
+  const { uaPublic, authSecret, uaKey } = await importSubscriptionKeys(keys);
   // A fresh sender key pair per message (RFC 8291 §2).
   const sender =
     overrides.senderKeys ??
@@ -110,12 +148,46 @@ export interface VapidConfig {
   subject: string;
 }
 
-const SUBJECT_RE = /^(mailto:[^\s@]+@[^\s@]+|https:\/\/\S+)$/;
-export const DEFAULT_SUBJECT = 'mailto:admin@example.com';
+/** A real domain name: dotted, letters/digits/hyphens, alphabetic TLD (so no IP literals or localhost). */
+const DOTTED_HOST_RE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-export function normaliseSubject(subject: string | undefined): string {
+/**
+ * The VAPID `sub` claim: a `mailto:` address or an `https:` URL on a real (dotted) domain.
+ * Returns it normalised (lower-case scheme and host), or null if it isn't usable. There is no
+ * fallback: push services (Apple in particular) reject tokens without a valid contact.
+ */
+export function normaliseSubject(subject: string | undefined): string | null {
   const s = subject?.trim() ?? '';
-  return SUBJECT_RE.test(s) ? s : DEFAULT_SUBJECT;
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):(.*)$/s.exec(s);
+  if (!m || /\s/.test(s)) return null;
+  const scheme = m[1].toLowerCase();
+  if (scheme === 'mailto') {
+    const addr = /^([^@?#/,]+)@([^@?#/,]+)$/.exec(m[2]);
+    if (!addr) return null;
+    const host = addr[2].toLowerCase();
+    return DOTTED_HOST_RE.test(host) ? `mailto:${addr[1]}@${host}` : null;
+  }
+  if (scheme === 'https') {
+    let url: URL;
+    try {
+      url = new URL(`https:${m[2]}`);
+    } catch {
+      return null;
+    }
+    if (url.username || url.password || !DOTTED_HOST_RE.test(url.hostname)) return null;
+    return url.href;
+  }
+  return null;
+}
+
+/** A VAPID public key as unpadded base64url, if it is a 65-byte uncompressed point (0x04 prefix). */
+export function normalisePublicKey(publicKey: string | undefined): string | null {
+  try {
+    const pub = b64urlDecode(publicKey?.trim() ?? '');
+    return pub.length === 65 && pub[0] === 4 ? b64urlEncode(pub) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function importVapidPrivateKey(publicKey: string, privateKey: string): Promise<CryptoKey> {
@@ -129,6 +201,50 @@ export async function importVapidPrivateKey(publicKey: string, privateKey: strin
     false,
     ['sign'],
   );
+}
+
+export type VapidLoad = { ok: true; signer: VapidSigner } | { ok: false; problem: string };
+
+/**
+ * Validates the VAPID settings once: subject, public key (a P-256 point), private key, and that
+ * they are one key pair (one sign + verify, well under 1 ms). `problem` names the setting at
+ * fault, never its value.
+ */
+export async function loadVapid(raw: { publicKey?: string; privateKey?: string; subject?: string }): Promise<VapidLoad> {
+  const privateKey = raw.privateKey?.trim() ?? '';
+  if (!raw.publicKey?.trim() || !privateKey) return { ok: false, problem: 'VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY must be set' };
+  const subject = normaliseSubject(raw.subject);
+  if (!subject) return { ok: false, problem: 'VAPID_SUBJECT must be a mailto: address or an https: URL on a real domain' };
+  const publicKey = normalisePublicKey(raw.publicKey);
+  if (!publicKey) return { ok: false, problem: 'VAPID_PUBLIC_KEY is not a base64url P-256 public key' };
+  let pub: CryptoKey;
+  try {
+    pub = await crypto.subtle.importKey('raw', b64urlDecode(publicKey), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+  } catch {
+    return { ok: false, problem: 'VAPID_PUBLIC_KEY is not a point on the P-256 curve' };
+  }
+  let d: Uint8Array;
+  try {
+    d = b64urlDecode(privateKey);
+  } catch {
+    d = new Uint8Array(0);
+  }
+  if (d.length !== 32) return { ok: false, problem: 'VAPID_PRIVATE_KEY is not a base64url 32-byte P-256 private key' };
+  let key: CryptoKey;
+  try {
+    key = await importVapidPrivateKey(publicKey, privateKey);
+  } catch {
+    // Some WebCrypto implementations (Node's) check the pair here, others only when signing.
+    return { ok: false, problem: 'VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY are not one key pair' };
+  }
+  try {
+    const probe = utf8('dosely-vapid-key-check');
+    const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, probe);
+    if (!(await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, pub, sig, probe))) throw new Error('mismatch');
+  } catch {
+    return { ok: false, problem: 'VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY are not one key pair' };
+  }
+  return { ok: true, signer: new VapidSigner({ publicKey, privateKey, subject }, key) };
 }
 
 /** Builds and signs a VAPID JWT (ES256; WebCrypto already returns the raw r||s that JWS needs). */
@@ -147,10 +263,16 @@ const JWT_MIN_LEFT_S = 3600;
 
 /** Signs VAPID tokens, caching one per push-service origin to save CPU. */
 export class VapidSigner {
-  private key: Promise<CryptoKey> | null = null;
+  private key: Promise<CryptoKey> | null;
   private cache = new Map<string, { token: string; exp: number }>();
 
-  constructor(readonly config: VapidConfig) {}
+  /** `config.publicKey` goes into `k=` verbatim, so pass it normalised (loadVapid does). */
+  constructor(
+    readonly config: VapidConfig,
+    key?: CryptoKey,
+  ) {
+    this.key = key ? Promise.resolve(key) : null;
+  }
 
   async authorization(endpoint: string, nowMs = Date.now()): Promise<string> {
     const aud = new URL(endpoint).origin;
@@ -198,35 +320,67 @@ export async function buildPushRequest(
   });
 }
 
-export type SendResult = 'ok' | 'gone' | 'error';
-
 /**
- * Sends one message. 404/410 mean the subscription expired; 401/403 mean it was made for a
- * different VAPID key (same rule as server/index.ts). Anything else is retried later.
+ * - ok:    delivered.
+ * - gone:  the subscription is gone for good (404/410, or keys that can never work): drop the device.
+ * - drop:  this message can never be sent (too large): drop the message, keep the device.
+ * - error: anything else (401/403, 429, 5xx, 3xx, network, timeout): keep both and retry later.
+ *          401/403 usually mean a VAPID problem (e.g. a contact Apple rejects), not a dead
+ *          subscription, so they must not delete devices.
  */
+export type SendResult = 'ok' | 'gone' | 'drop' | 'error';
+
+/** Per-push timeout: one slow push service must not hold up a whole alarm run for long. */
+export const PUSH_TIMEOUT_MS = 6_000;
+
+/** The start of a push service's error body, made safe to log (it never contains our payload). */
+async function errorSnippet(res: Response, max = 200): Promise<string> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let text = '';
+  try {
+    while (text.length < max) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += dec.decode(value, { stream: true });
+    }
+  } catch {
+    /* ignore */
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return text.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, max);
+}
+
+/** Sends one message. See SendResult for how outcomes map. */
 export async function sendPush(
   signer: VapidSigner,
   target: PushTarget,
   payload: string,
   opts: PushOptions = {},
-): Promise<{ result: SendResult; status: number }> {
+): Promise<{ result: SendResult; status: number; detail?: string }> {
   let req: Request;
   try {
     req = await buildPushRequest(signer, target, payload, opts);
   } catch (err) {
-    console.warn('[push] could not build push request:', (err as Error).message);
-    return { result: 'error', status: 0 };
+    const detail = (err as Error).message;
+    if (err instanceof SubscriptionKeyError) return { result: 'gone', status: 0, detail };
+    if (err instanceof PayloadTooLargeError) return { result: 'drop', status: 0, detail };
+    return { result: 'error', status: 0, detail };
   }
   try {
-    const res = await fetch(req, { signal: AbortSignal.timeout(opts.timeoutMs ?? 10_000) });
-    // Drain the body so the connection is released.
-    await res.body?.cancel().catch(() => {});
+    // Never follow redirects: only the endpoint itself was checked against the allowed push services.
+    const res = await fetch(req, { redirect: 'manual', signal: AbortSignal.timeout(opts.timeoutMs ?? PUSH_TIMEOUT_MS) });
     const s = res.status;
-    if (s >= 200 && s < 300) return { result: 'ok', status: s };
-    if (s === 404 || s === 410 || s === 401 || s === 403) return { result: 'gone', status: s };
-    return { result: 'error', status: s };
+    if (s >= 200 && s < 300) {
+      // Drain the body so the connection is released.
+      await res.body?.cancel().catch(() => {});
+      return { result: 'ok', status: s };
+    }
+    const detail = await errorSnippet(res);
+    return { result: s === 404 || s === 410 ? 'gone' : 'error', status: s, detail };
   } catch (err) {
-    console.warn('[push] network error:', (err as Error).message);
-    return { result: 'error', status: 0 };
+    return { result: 'error', status: 0, detail: `network: ${(err as Error).message}` };
   }
 }

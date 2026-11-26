@@ -109,12 +109,61 @@ describe('local reminder catch-up', () => {
     expect(showNotification).not.toHaveBeenCalled();
   });
 
-  it('shows only the most recent missed dose per medication', async () => {
+  it('shows one grouped catch-up notification for the most recent missed dose per medication', async () => {
     const { syncReminders } = await load();
     await syncReminders([med('a', ['07:30', '08:00', '08:45']), med('b', ['08:15'])], []);
     await vi.advanceTimersByTimeAsync(0);
-    const tags = showNotification.mock.calls.map((c) => (c[1] as { tag: string }).tag).sort();
-    expect(tags).toEqual([`a@${at(8, 45)}`, `b@${at(8, 15)}`].sort());
+    expect(showNotification).toHaveBeenCalledTimes(1);
+    const [title, opts] = showNotification.mock.calls[0] as [
+      string,
+      {
+        body: string;
+        tag: string;
+        actions: { action: string; title: string }[];
+        data: { count?: number; reminder: { doses?: { medId: string; at: number }[] } };
+      },
+    ];
+    expect(title).toBe('Time for your medications');
+    expect(opts.body).toBe('2 medications are due. Open Dosely to review them.');
+    expect(opts.tag).toBe(`b@${at(8, 15)}`);
+    expect(opts.actions).toEqual([{ action: 'snooze', title: 'Snooze 10 min' }]);
+    expect(opts.data.count).toBe(2);
+    expect(opts.data.reminder.doses).toEqual([
+      { medId: 'b', at: at(8, 15) },
+      { medId: 'a', at: at(8, 45) },
+    ]);
+  });
+
+  it('skips missed doses already shown and uses single-dose actions when only one med is missed', async () => {
+    store.set('medtracker.shownReminders', JSON.stringify({ [`a@${at(8, 45)}`]: NOW - 60_000 }));
+    const { syncReminders } = await load();
+    await syncReminders([med('a', ['08:45']), med('b', ['08:15'])], []);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(showNotification).toHaveBeenCalledTimes(1);
+    const [title, opts] = showNotification.mock.calls[0] as [
+      string,
+      {
+        body: string;
+        tag: string;
+        actions: { action: string; title: string }[];
+        data: { count?: number; reminder: { doses?: unknown[] } };
+      },
+    ];
+    expect(title).toBe('Time for your medication');
+    expect(opts.body).toBe('Open Dosely to review your dose.');
+    expect(opts.tag).toBe(`b@${at(8, 15)}`);
+    expect(opts.actions).toEqual([
+      { action: 'take', title: 'Mark as taken' },
+      { action: 'snooze', title: 'Snooze 10 min' },
+    ]);
+    expect(opts.data.count).toBeUndefined();
+    expect(opts.data.reminder.doses).toBeUndefined();
+
+    // Cold-start reload with both already shown does not show anything.
+    const mod2 = await load();
+    await mod2.syncReminders([med('a', ['08:45']), med('b', ['08:15'])], []);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(showNotification).toHaveBeenCalledTimes(1);
   });
 
   it('does not catch up on doses due before the med was added or its reminders were turned on', async () => {

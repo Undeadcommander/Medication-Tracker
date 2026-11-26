@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error http_ece ships no types
 import ece from 'http_ece';
 import { decodeProtectedHeader, importJWK, jwtVerify } from 'jose';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   MAX_PLAINTEXT,
   RECORD_SIZE,
@@ -15,7 +15,11 @@ import {
   buildPushRequest,
   encryptPayload,
   importVapidPrivateKey,
+  loadVapid,
+  normalisePublicKey,
   normaliseSubject,
+  normaliseSubscriptionKeys,
+  sendPush,
   signVapidJwt,
 } from '../src/webpush';
 
@@ -154,11 +158,206 @@ describe('RFC 8292 VAPID', () => {
     expect(later).not.toBe(a);
   });
 
-  it('rejects malformed keys and falls back to a valid subject', async () => {
+  it('rejects malformed keys and validates subjects strictly without fallback', async () => {
     await expect(importVapidPrivateKey('abc', 'def')).rejects.toThrow();
+
     expect(normaliseSubject('mailto:a@b.co')).toBe('mailto:a@b.co');
+    expect(normaliseSubject('MAILTO:a@B.CO')).toBe('mailto:a@b.co');
+    expect(normaliseSubject('HTTPS://Undeadcommander.github.io/Medication-Tracker/')).toBe(
+      'https://undeadcommander.github.io/Medication-Tracker/',
+    );
     expect(normaliseSubject('https://example.org/contact')).toBe('https://example.org/contact');
-    expect(normaliseSubject('nonsense')).toBe('mailto:admin@example.com');
-    expect(normaliseSubject(undefined)).toBe('mailto:admin@example.com');
+
+    for (const bad of [
+      undefined,
+      '',
+      'nonsense',
+      'mailto:a@localhost',
+      'https://localhost',
+      'https://localhost/x',
+      'mailto:a@1.2.3.4',
+      'https://127.0.0.1/',
+      'http://example.org',
+      'mailto:a b@c.org',
+      'https://user:pw@example.org/',
+      'mailto:@example.org',
+    ]) {
+      expect(normaliseSubject(bad), String(bad)).toBeNull();
+    }
+  });
+
+  it('normalisePublicKey converts padded/standard base64 to unpadded base64url and rejects invalid inputs', () => {
+    const raw = new Uint8Array(65);
+    raw[0] = 0x04;
+    raw.fill(0xfb, 1, 33);
+    raw.fill(0xef, 33, 65);
+    const stdBase64 = Buffer.from(raw).toString('base64');
+    expect(stdBase64).toMatch(/[+/]/);
+    expect(stdBase64).toMatch(/=$/);
+
+    const expected = b64urlEncode(raw);
+    expect(normalisePublicKey(stdBase64)).toBe(expected);
+    expect(normalisePublicKey(vapidKeys().publicKey + '=')).toMatch(/^[A-Za-z0-9_-]{87}$/);
+
+    expect(normalisePublicKey(b64urlEncode(new Uint8Array(64)))).toBeNull();
+    const compressed = new Uint8Array(65);
+    compressed[0] = 0x02;
+    expect(normalisePublicKey(b64urlEncode(compressed))).toBeNull();
+    expect(normalisePublicKey('not*valid')).toBeNull();
+    expect(normalisePublicKey('')).toBeNull();
+    expect(normalisePublicKey(undefined)).toBeNull();
+  });
+
+  it('loadVapid validates key pairs and subjects, normalises config, and never leaks key values in errors', async () => {
+    const a = vapidKeys();
+    const b = vapidKeys();
+    const stdPub = Buffer.from(b64urlDecode(a.publicKey)).toString('base64');
+
+    const ok = await loadVapid({
+      publicKey: stdPub,
+      privateKey: a.privateKey,
+      subject: 'MAILTO:Alerts@Example.ORG',
+    });
+    expect(ok.ok).toBe(true);
+    if (!ok.ok) throw new Error('expected ok');
+    expect(ok.signer.config.publicKey).toBe(a.publicKey);
+    expect(ok.signer.config.subject).toBe('mailto:Alerts@example.org');
+
+    const auth = await ok.signer.authorization('https://fcm.googleapis.com/fcm/send/abc');
+    const m = /^vapid t=[^,]+, k=(.+)$/.exec(auth);
+    expect(m?.[1]).toBe(a.publicKey);
+
+    const mismatched = await loadVapid({ publicKey: a.publicKey, privateKey: b.privateKey, subject: 'mailto:a@b.co' });
+    expect(mismatched.ok).toBe(false);
+    if (mismatched.ok) throw new Error('expected failure');
+    expect(mismatched.problem).toMatch(/key pair/i);
+    expect(mismatched.problem).not.toContain(a.publicKey);
+    expect(mismatched.problem).not.toContain(b.privateKey);
+
+    for (const subject of [undefined, '', 'https://localhost/']) {
+      const res = await loadVapid({ publicKey: a.publicKey, privateKey: a.privateKey, subject });
+      expect(res.ok).toBe(false);
+      if (res.ok) throw new Error('expected failure');
+      expect(res.problem).toContain('VAPID_SUBJECT');
+      expect(res.problem).not.toContain(a.publicKey);
+      expect(res.problem).not.toContain(a.privateKey);
+    }
+
+    for (const bad of [
+      { privateKey: a.privateKey, subject: 'mailto:a@b.co' },
+      { publicKey: a.publicKey, subject: 'mailto:a@b.co' },
+      { publicKey: 'bad', privateKey: a.privateKey, subject: 'mailto:a@b.co' },
+      { publicKey: a.publicKey, privateKey: 'bad', subject: 'mailto:a@b.co' },
+    ]) {
+      const res = await loadVapid(bad);
+      expect(res.ok).toBe(false);
+      if (res.ok) throw new Error('expected failure');
+      expect(res.problem).not.toContain(a.publicKey);
+      expect(res.problem).not.toContain(a.privateKey);
+    }
+  });
+});
+
+describe('normaliseSubscriptionKeys', () => {
+  it('accepts valid keys, normalises padded/standard base64, and rejects bad lengths or off-curve points', async () => {
+    const s = subscriber();
+    expect(await normaliseSubscriptionKeys(s.keys)).toEqual(s.keys);
+
+    const stdP256 = Buffer.from(b64urlDecode(s.keys.p256dh)).toString('base64');
+    const stdAuth = Buffer.from(b64urlDecode(s.keys.auth)).toString('base64');
+    expect(await normaliseSubscriptionKeys({ p256dh: stdP256, auth: stdAuth })).toEqual(s.keys);
+
+    expect(
+      await normaliseSubscriptionKeys({
+        p256dh: b64urlEncode(new Uint8Array(64)),
+        auth: s.keys.auth,
+      }),
+    ).toBeNull();
+    expect(
+      await normaliseSubscriptionKeys({
+        p256dh: s.keys.p256dh,
+        auth: b64urlEncode(new Uint8Array(15)),
+      }),
+    ).toBeNull();
+    expect(
+      await normaliseSubscriptionKeys({
+        p256dh: s.keys.p256dh,
+        auth: b64urlEncode(new Uint8Array(17)),
+      }),
+    ).toBeNull();
+
+    const offCurve = new Uint8Array(65);
+    offCurve[0] = 0x04;
+    expect(
+      await normaliseSubscriptionKeys({
+        p256dh: b64urlEncode(offCurve),
+        auth: s.keys.auth,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('sendPush', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const targetFor = (s: ReturnType<typeof subscriber>) => ({
+    endpoint: 'https://fcm.googleapis.com/fcm/send/test',
+    keys: s.keys,
+  });
+
+  it('maps HTTP statuses, checks redirect:manual, caps error detail, and handles network/key/size failures', async () => {
+    const signer = new VapidSigner({ ...vapidKeys(), subject: 'mailto:a@b.co' });
+    const s = subscriber();
+    const target = targetFor(s);
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    fetchSpy.mockResolvedValueOnce(new Response(null, { status: 201 }));
+    expect(await sendPush(signer, target, '{"title":"ok"}')).toEqual({ result: 'ok', status: 201 });
+    expect(fetchSpy.mock.calls[0]?.[1]?.redirect).toBe('manual');
+
+    for (const status of [404, 410]) {
+      fetchSpy.mockResolvedValueOnce(new Response('gone', { status }));
+      expect(await sendPush(signer, target, '{}')).toMatchObject({ result: 'gone', status });
+    }
+
+    for (const status of [401, 403]) {
+      fetchSpy.mockResolvedValueOnce(new Response('{"reason":"BadJwtToken"}', { status }));
+      const res = await sendPush(signer, target, '{}');
+      expect(res.result).toBe('error');
+      expect(res.status).toBe(status);
+      expect(res.detail).toContain('{"reason":"BadJwtToken"}');
+    }
+
+    for (const status of [429, 500, 301]) {
+      fetchSpy.mockResolvedValueOnce(new Response('err', { status }));
+      expect(await sendPush(signer, target, '{}')).toMatchObject({ result: 'error', status });
+    }
+
+    const hugeBody = 'X'.repeat(10 * 1024);
+    fetchSpy.mockResolvedValueOnce(new Response(hugeBody, { status: 403 }));
+    const hugeRes = await sendPush(signer, target, '{}');
+    expect(hugeRes.result).toBe('error');
+    expect(hugeRes.detail?.length).toBeLessThanOrEqual(200);
+
+    fetchSpy.mockRejectedValueOnce(new Error('socket reset'));
+    const netRes = await sendPush(signer, target, '{}');
+    expect(netRes.result).toBe('error');
+    expect(netRes.status).toBe(0);
+    expect(netRes.detail).toContain('socket reset');
+
+    const callsBefore = fetchSpy.mock.calls.length;
+    const offCurve = new Uint8Array(65);
+    offCurve[0] = 0x04;
+    expect(
+      await sendPush(signer, { endpoint: target.endpoint, keys: { p256dh: b64urlEncode(offCurve), auth: s.keys.auth } }, '{}'),
+    ).toMatchObject({ result: 'gone', status: 0 });
+    expect(fetchSpy).toHaveBeenCalledTimes(callsBefore);
+
+    const tooBigUtf8 = 'é'.repeat(Math.floor(MAX_PLAINTEXT / 2) + 1);
+    expect(await sendPush(signer, target, tooBigUtf8)).toMatchObject({ result: 'drop', status: 0 });
+    expect(fetchSpy).toHaveBeenCalledTimes(callsBefore);
   });
 });

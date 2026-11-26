@@ -100,13 +100,26 @@ export interface AppData {
   doseLogs: DoseLog[];
 }
 
+/** One scheduled dose covered by a grouped reminder. Its dose id is `${medId}@${at}`. */
+export interface PushDose {
+  medId: string;
+  /** Epoch ms (UTC) the dose is due. */
+  at: number;
+}
+
 /** A reminder the client asks the push server to deliver. Shared with server. */
 export interface PushReminder {
-  /** Stable id: `${medId}@${epochMs}`. */
+  /** Stable id: `${medId}@${epochMs}` (for a group, the id of its earliest dose). */
   id: string;
   medId: string;
   /** Epoch ms (UTC) when the notification should be shown. */
   at: number;
+  /** Generic text only (see shared/reminderText.ts); servers ignore it and use the same wording. */
   title: string;
   body: string;
+  /**
+   * Grouped reminder: every dose it covers (2 or more, earliest first, all due within
+   * GROUP_WINDOW_MS of `at`). Absent for a single dose.
+   */
+  doses?: PushDose[];
 }

@@ -15,6 +15,12 @@ const ICON = new URL('icons/icon-192.png', SCOPE).href;
 // API root is passed as ?api=… when the page registers the worker; absent = no reminder server.
 const API = new URL(self.location.href).searchParams.get('api');
 
+/** A notification for several doses (data.reminder.doses): it can be snoozed, not marked as taken. */
+function isGroup(data) {
+  const doses = data && data.reminder && data.reminder.doses;
+  return Array.isArray(doses) && doses.length > 1;
+}
+
 function notificationOptions({ body, tag, data }) {
   return {
     body,
@@ -24,10 +30,13 @@ function notificationOptions({ body, tag, data }) {
     badge: ICON,
     renotify: true,
     requireInteraction: true,
-    actions: [
-      { action: 'take', title: 'Mark as taken' },
-      { action: 'snooze', title: 'Snooze 10 min' },
-    ],
+    // Grouped: no "Mark as taken" (the user should see which doses first); snooze covers the group.
+    actions: isGroup(data)
+      ? [{ action: 'snooze', title: 'Snooze 10 min' }]
+      : [
+          { action: 'take', title: 'Mark as taken' },
+          { action: 'snooze', title: 'Snooze 10 min' },
+        ],
   };
 }
 
@@ -81,6 +90,7 @@ async function handleClick(event) {
   const action = event.action;
 
   if (action === 'snooze') {
+    // data.reminder carries the group's doses, so the whole group comes back.
     if (!data.reminder) return;
     let snoozed = false;
     if (data.deviceId && API) {
@@ -113,7 +123,7 @@ async function handleClick(event) {
     return;
   }
 
-  if (action === 'take' && data.medId && data.scheduledFor) {
+  if (action === 'take' && data.medId && data.scheduledFor && !isGroup(data)) {
     const all = await appWindows();
     if (all.length) {
       const client = all[0];
