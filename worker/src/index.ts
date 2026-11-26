@@ -2,7 +2,7 @@
 // The Worker handles CORS and security headers; one Durable Object (PushStore) does the rest.
 import { PushStore, type Env } from './store';
 import { storeStub } from './stub';
-import { parseOriginList } from './validate';
+import { MAX_BODY_BYTES, parseOriginList } from './validate';
 
 // workerd only accepts handlers and classes as named exports of the entry module, so helpers
 // (storeStub, constants) live in other modules.
@@ -51,6 +51,11 @@ export default {
       (request.method === 'POST' &&
         /^\/api\/push\/(subscribe|unsubscribe|reminders|snooze|test)$/.test(url.pathname));
     if (!known) return withHeaders(jsonError('not found', 404), cors);
+    // Refuse a declared oversize body here, before streaming it to the Durable Object (which also
+    // enforces the cap while reading, for bodies without a Content-Length).
+    if (Number(request.headers.get('Content-Length')) > MAX_BODY_BYTES) {
+      return withHeaders(jsonError('payload too large', 413), cors);
+    }
 
     try {
       return withHeaders(await storeStub(env).fetch(request), cors);
