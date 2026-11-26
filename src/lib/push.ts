@@ -199,13 +199,17 @@ async function getServerKey(force = false): Promise<Uint8Array<ArrayBuffer> | nu
 /**
  * Make sure the browser's push subscription was created for the server's current VAPID key
  * (it changes if server/data is wiped). Re-subscribes and re-registers when it doesn't match.
- * Returns the usable subscription, or null if there isn't one.
+ * Returns the usable subscription (`registered` when it was just sent to the server), or null if
+ * there isn't one.
  */
-async function ensureCurrentSubscription(reg: ServiceWorkerRegistration, forceKey = false): Promise<PushSubscription | null> {
+async function ensureCurrentSubscription(
+  reg: ServiceWorkerRegistration,
+  forceKey = false,
+): Promise<{ sub: PushSubscription; registered: boolean } | null> {
   const sub = await reg.pushManager.getSubscription();
   if (!sub) return null;
   const key = await getServerKey(forceKey);
-  if (!key || sameKey(sub.options.applicationServerKey, key)) return sub;
+  if (!key || sameKey(sub.options.applicationServerKey, key)) return { sub, registered: false };
   await sub.unsubscribe().catch(() => {});
   let fresh: PushSubscription;
   try {
@@ -220,7 +224,7 @@ async function ensureCurrentSubscription(reg: ServiceWorkerRegistration, forceKe
     body: { deviceId: getDeviceId(), subscription: fresh.toJSON() },
   });
   lastPostSig = '';
-  return res.ok ? fresh : null;
+  return res.ok ? { sub: fresh, registered: true } : null;
 }
 
 // ---------- service worker ----------
@@ -304,8 +308,12 @@ export async function enablePush(): Promise<PushState> {
     const res = await fetchJson(api('push/subscribe'), {
       method: 'POST',
       body: { deviceId: getDeviceId(), subscription: sub.toJSON() },
-    });
-    return res.ok ? 'subscribed' : 'granted';
+    }).catch(() => null);
+    if (res?.ok) return 'subscribed';
+    // The server didn't take it. Drop the subscription, or getPushState() would report push as on
+    // while only local reminders work; Settings then offers "Retry push setup".
+    await sub.unsubscribe().catch(() => {});
+    return 'granted';
   } catch (err) {
     console.warn('Push subscription failed, using local reminders:', err);
     return 'granted';
@@ -702,10 +710,12 @@ async function postReminders(reminders: PushReminder[], dismissed: string[]): Pr
     // Server doesn't know this device (e.g. its db was reset): re-register the subscription and retry.
     // The server also drops devices whose subscription was rejected (expired or wrong VAPID key).
     const reg = await activeRegistration();
-    const sub = reg ? await ensureCurrentSubscription(reg, true) : null;
-    if (!sub) return false;
-    const re = await fetchJson(api('push/subscribe'), { method: 'POST', body: { deviceId, subscription: sub.toJSON() } });
-    if (!re.ok) return false;
+    const cur = reg ? await ensureCurrentSubscription(reg, true) : null;
+    if (!cur) return false;
+    if (!cur.registered) {
+      const re = await fetchJson(api('push/subscribe'), { method: 'POST', body: { deviceId, subscription: cur.sub.toJSON() } });
+      if (!re.ok) return false;
+    }
     res = await send();
   }
   if (res.ok) {
@@ -739,8 +749,8 @@ async function doSync(
   if (state === 'subscribed') {
     try {
       const reg = await activeRegistration();
-      const sub = reg ? await ensureCurrentSubscription(reg) : null;
-      if (sub && (await postReminders(reminders, dismissed))) {
+      const cur = reg ? await ensureCurrentSubscription(reg) : null;
+      if (cur && (await postReminders(reminders, dismissed))) {
         clearLocalTimers();
         lastReminders = [];
         lastMissed = [];
@@ -781,14 +791,18 @@ export async function sendTestNotification(): Promise<void> {
     throw new Error('Notifications are not enabled for this device.');
   }
   if ((await getPushState()) === 'subscribed') {
-    try {
-      const res = await fetchJson(api('push/test'), { method: 'POST', body: { deviceId: getDeviceId() } });
-      if (res.ok) return;
-      if (res.status === 429) throw new Error('Please wait a few seconds before sending another test.');
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('Please wait')) throw err;
-      /* server unreachable: fall back to a local notification */
+    // Unreachable server (null): fall back to a local notification below.
+    const res = await fetchJson(api('push/test'), { method: 'POST', body: { deviceId: getDeviceId() } }).catch(() => null);
+    if (res?.ok) return;
+    if (res?.status === 429) throw new Error('Please wait a few seconds before sending another test.');
+    if (res?.status === 404 || res?.status === 410) {
+      // The server doesn't know this device (or its subscription expired): drop the browser's
+      // subscription so Settings offers "Retry push setup", which registers a fresh one.
+      const reg = await activeRegistration();
+      await (await reg?.pushManager.getSubscription())?.unsubscribe().catch(() => {});
+      throw new Error('This device is no longer registered for push reminders. Tap "Retry push setup".');
     }
+    if (res) throw new Error('The reminder server could not send a notification right now. Please try again later.');
   }
   const reg = await activeRegistration();
   if (!reg) throw new Error('Notifications are not available in this browser.');
