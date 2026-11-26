@@ -1,0 +1,26 @@
+{
+  // Dosely reminder server on Cloudflare Workers (free plan). See README.md → "Reminder server".
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dosely-push",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  // Not needed: no Node APIs are used. Web Push uses WebCrypto.
+  "compatibility_flags": [],
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [{ "name": "PUSH_STORE", "class_name": "PushStore" }]
+  },
+  // SQLite-backed Durable Objects are the ones the free plan allows.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PushStore"] }],
+  // Watchdog: re-arms the Durable Object's alarm if it is ever lost. Alarms do the real timing.
+  "triggers": { "crons": ["* * * * *"] },
+  "vars": {
+    // Exact origins allowed to call the API from a browser (comma-separated).
+    "ALLOWED_ORIGINS": "https://undeadcommander.github.io",
+    // Dev/test only: extra push-endpoint origins (e.g. a mock push service). Keep empty in production.
+    "EXTRA_PUSH_ORIGINS": ""
+  },
+  // Secrets (set with `npx wrangler secret put <NAME>`, never committed):
+  //   VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
+  "observability": { "enabled": true }
+}

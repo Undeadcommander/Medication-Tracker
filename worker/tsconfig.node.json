@@ -1,0 +1,7 @@
+{
+  // Node-side files: crypto cross-check tests, the key script, and the Vitest configs.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node"], "lib": ["ES2023", "DOM"], "allowJs": true, "checkJs": true },
+  "include": ["test/**/*.node.test.ts", "scripts", "vitest.config.ts", "vitest.node.config.ts"],
+  "exclude": []
+}
