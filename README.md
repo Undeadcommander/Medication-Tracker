@@ -52,9 +52,24 @@ How it works: sign-in uses a Google popup (a full-page redirect on an iPhone/iPa
 - **iPhone/iPad** (iOS/iPadOS 16.4+): Apple only allows web push for sites that are installed to the Home Screen. In Safari, tap **Share → Add to Home Screen**, open Dosely from the Home Screen, then turn on notifications. The settings screen walks you through it.
 - Push needs **HTTPS** everywhere except `localhost`.
 
-**Reminder server.** For reminders to arrive while Dosely is *closed*, the push server (`server/index.ts`) has to run somewhere that supports Node with HTTPS and a persistent disk, such as Render, Fly.io, Railway or Google Cloud Run. GitHub Pages can't run it. Without it, the Pages site builds with `VITE_API_BASE=none`, and reminders appear only while the app is open on screen (iPhone pauses it when you switch away). Reopening within 2 hours of a missed dose shows its reminder then. To connect one:
-1. Deploy the server with `npm start`, and set `ALLOWED_ORIGINS=https://undeadcommander.github.io` and `VAPID_SUBJECT=mailto:<your address>`. Keep `server/data/` on persistent storage: if `vapid.json` changes, every device has to turn notifications on again.
-2. In GitHub, go to **Settings → Secrets and variables → Actions → Variables** and add `VITE_API_BASE` = `https://<your-server>/api`. Then re-run the Pages workflow.
+**Reminder server.** For reminders to arrive while Dosely is *closed*, the push server has to run somewhere with HTTPS — GitHub Pages can't run it. Without a server, the Pages site builds with `VITE_API_BASE=none`, and reminders appear only while the app is open on screen (iPhone pauses it when you switch away). Reopening within 2 hours of a missed dose shows its reminder then.
+
+The recommended host is **Cloudflare Workers** (free plan), using the Worker in [`worker/`](worker/) (one SQLite-backed Durable Object stores devices and reminders, an alarm fires at the next due reminder, and a 1-minute cron acts as a watchdog). To deploy it (step 1 enters `worker/`, and steps 2–5 run from there):
+1. `cd worker && npm ci`
+2. `npx wrangler login` (opens a browser; a free Cloudflare account is enough).
+3. Generate VAPID keys: `npm run gen-vapid` (prints `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY`; writes nothing to disk).
+4. `npx wrangler deploy` — creates the Worker, its Durable Object and the cron, and prints the URL `https://dosely-push.<your-subdomain>.workers.dev` (the first deploy asks you to pick a `workers.dev` subdomain). `ALLOWED_ORIGINS` is already set in [`worker/wrangler.jsonc`](worker/wrangler.jsonc) to `https://undeadcommander.github.io` (edit `vars` there for another front-end origin; comma-separated exact origins).
+5. Set the three secrets (each one takes effect right away, no redeploy needed):
+   - `npx wrangler secret put VAPID_PUBLIC_KEY`
+   - `npx wrangler secret put VAPID_PRIVATE_KEY`
+   - `npx wrangler secret put VAPID_SUBJECT` (value `mailto:<your address>` or an `https:` URL; Apple rejects pushes without a valid contact)
+   If the VAPID keys ever change, every device has to turn notifications on again.
+6. Check: `curl https://dosely-push.<your-subdomain>.workers.dev/api/health` → `{"ok":true,"devices":0,...}`, and `/api/push/public-key` returns your public key (a `503` there means the VAPID secrets aren't set).
+7. In GitHub, go to **Settings → Secrets and variables → Actions → Variables** and add `VITE_API_BASE` = `https://dosely-push.<your-subdomain>.workers.dev/api` (with the `/api` suffix, no trailing slash). Re-run the Pages workflow, then on each device turn notifications on again (**Notification settings**).
+
+**Local development.** In `worker/`, `npm run dev` runs `wrangler dev --local`; secrets for local dev go in `worker/.dev.vars` (gitignored, `KEY=value` lines). `npm test` runs the crypto tests (Node, checked against `http_ece` and `jose`) and the Durable Object tests (Miniflare).
+
+**Limits.** The Cloudflare Workers free plan gives 100,000 requests/day, which this app uses a tiny fraction of (the cron alone is 1,440/day). The Worker sends up to 10 pushes per alarm run (leftovers re-arm immediately), drops reminders more than 15 minutes late, retries failed sends after 20 seconds, and only accepts subscription endpoints on `web.push.apple.com`, `fcm.googleapis.com`, `*.push.services.mozilla.com`, and `*.notify.windows.com`. The old Node server (`server/index.ts`, `npm start`) still works for self-hosting on any Node host with a persistent disk: set `ALLOWED_ORIGINS` and `VAPID_SUBJECT`, and keep `server/data/` on persistent storage so `vapid.json` doesn't change.
 
 How it works: whenever your medications or dose log change, the client works out the next 30 days of dose times and sends that list to the push server, keyed by a random per-device secret. The server sends each one when it's due. Opening the app refreshes the list. If the server can't be reached, the app shows reminders itself while it's open.
 
@@ -113,6 +128,7 @@ shared/        types + schedule engine (used by client and server)
 src/lib/       store, auth (Google), push client, drug lookup, vault (encryption), dose helpers
 src/components UI: tiles, detail, form, schedule editor, notifications, export/import
 server/        Express + web-push reminder server
+worker/        Cloudflare Worker port of the reminder server (Durable Object + Web Push)
 public/        service worker, manifest, icons
 ```
 
