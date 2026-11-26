@@ -772,6 +772,38 @@ export class PushStore extends DurableObject<Env> {
     return ranked.slice(0, BATCH_SIZE).map((x) => x.row);
   }
 
+  /**
+   * Removes just-delivered doses from this device's other queued (non-snoozed) reminders: a row
+   * left with no doses is deleted, a shrunken one fires at its earliest remaining dose. Call inside
+   * a transaction. A row holding a dose is anchored at or before it, so only rows up to the latest
+   * delivered dose are read.
+   */
+  private stripDelivered(deviceId: string, delivered: Array<PushDose & { id: string }>): void {
+    const done = new Set(delivered.map((m) => m.id));
+    const hi = Math.max(...delivered.map((m) => m.at));
+    const rows = this.sql
+      .exec<ReminderRow>('SELECT * FROM reminders WHERE device_id = ? AND snoozed = 0 AND at <= ?', deviceId, hi)
+      .toArray();
+    for (const row of rows) {
+      const members = membersOf(row);
+      const left = members.filter((m) => !done.has(m.id));
+      if (left.length === members.length) continue;
+      this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, row.id);
+      const first = left[0];
+      if (!first) continue;
+      this.sql.exec(
+        `INSERT OR REPLACE INTO reminders (device_id, id, med_id, at, doses, snoozed, orig_id, orig_at, due_at, tries)
+         VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?, 0)`,
+        deviceId,
+        first.id,
+        first.medId,
+        first.at,
+        left.length >= 2 ? encodeDoses(left) : null,
+        first.at,
+      );
+    }
+  }
+
   /** Sends one device's share of a run, in order, stopping if the subscription is gone. Returns attempts. */
   private async sendForDevice(signer: VapidSigner, rows: DueRow[], now: number): Promise<number> {
     const d = rows[0];
@@ -799,9 +831,13 @@ export class PushStore extends DurableObject<Env> {
         this.ctx.storage.transactionSync(() => {
           this.sql.exec('DELETE FROM reminders WHERE device_id = ? AND id = ?', deviceId, r.id);
           if (!sameDevice) return;
-          for (const m of membersOf(r)) {
+          const delivered = membersOf(r);
+          for (const m of delivered) {
             this.sql.exec('INSERT OR REPLACE INTO sent (device_id, id, at) VALUES (?, ?, ?)', deviceId, m.id, lastOk);
           }
+          // A sync that ran while the push was in flight couldn't see these doses as sent yet, so it
+          // may have re-queued them in a regrouped row (e.g. the group's later dose on its own).
+          this.stripDelivered(deviceId, delivered);
         });
       } else if (result === 'gone') {
         if (sameDevice) this.dropDevice(deviceId);

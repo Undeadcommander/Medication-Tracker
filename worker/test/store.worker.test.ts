@@ -1261,6 +1261,44 @@ describe('validation, grouping, group snooze, and payload size', () => {
     });
   });
 
+  it('does not re-send a group dose that a sync re-queued while the group push was in flight', async () => {
+    const id = deviceId();
+    const sub = await makeSubscriber();
+    await subscribe(id, sub);
+    const T1 = T0 + 60_000;
+    const T2 = T1 + 5 * 60_000;
+    const group = {
+      id: `a@${T1}`,
+      medId: 'a',
+      at: T1,
+      title: 'x',
+      body: 'y',
+      doses: [
+        { medId: 'a', at: T1 },
+        { medId: 'b', at: T2 },
+      ],
+    };
+    await apiJson('push/reminders', { deviceId: id, reminders: [group] });
+
+    // The client re-syncs the same group while the push service is still answering.
+    let synced: unknown = null;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = new Request(input as RequestInfo, init);
+      sent.push({ url: req.url, headers: req.headers, body: new Uint8Array(await req.arrayBuffer()) });
+      if (!synced) synced = await apiJson('push/reminders', { deviceId: id, reminders: [group] });
+      return new Response(null, { status: 201 });
+    });
+    setNow(T1);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+    expect(synced).toEqual({ status: 200, data: { ok: true, count: 1 } }); // it re-queued b@T2 alone
+    expect(await queued(id)).toEqual([]); // ...which the delivered group then removed
+
+    setNow(T2);
+    await fireAlarm();
+    expect(sent).toHaveLength(1);
+  });
+
   it('group snooze: fires as group, shrinks when one dose is dismissed, and drops when both dismissed', async () => {
     const id = deviceId();
     const sub = await makeSubscriber();
