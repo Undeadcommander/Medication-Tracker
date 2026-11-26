@@ -20,6 +20,8 @@ const KEY_RE = /^[A-Za-z0-9_\-+/]+={0,2}$/;
 const MAX_KEY_CHARS = 128;
 /** Unpaired UTF-16 surrogates (not valid text; JSON.stringify escapes them to 6 bytes each). */
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+/** Shared by every clipText call (replace() resets a global regex's lastIndex itself). */
+const LONE_SURROGATES_G = new RegExp(LONE_SURROGATE_RE.source, 'g');
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 export class HttpError extends Error {
@@ -107,7 +109,7 @@ export function parseSubscription(v: unknown, extraOrigins: ReadonlySet<string> 
  * unpaired surrogates (so the result is always well-formed text).
  */
 export function clipText(s: string, max: number): string {
-  const clean = s.replace(new RegExp(LONE_SURROGATE_RE.source, 'g'), '\uFFFD');
+  const clean = s.replace(LONE_SURROGATES_G, '\uFFFD');
   if (clean.length <= max) return clean;
   const code = clean.charCodeAt(max - 1);
   return clean.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
