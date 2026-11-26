@@ -204,6 +204,13 @@ describe('HTTP API', () => {
     expect((await apiJson('health')).data.devices).toBe(1);
     expect(await queued(id)).toHaveLength(1);
     expect(await alarmTime()).toBeGreaterThanOrEqual(at + 1000 + 60_000);
+
+    // A request that re-arms while the tick is backing off must not pull the alarm back to now.
+    setNow(at + 5000);
+    const other = deviceId();
+    await subscribe(other, await makeSubscriber());
+    await apiJson('push/reminders', { deviceId: other, reminders: [reminder('m2', at + 3_600_000)] });
+    expect(await alarmTime()).toBeGreaterThanOrEqual(at + 1000 + 60_000);
   });
 
   it('sets CORS headers only for allowed origins, and security headers always', async () => {

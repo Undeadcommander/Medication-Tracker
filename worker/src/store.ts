@@ -226,6 +226,8 @@ export class PushStore extends DurableObject<Env> {
   private sql: SqlStorage;
   private vapidLoad: Promise<VapidLoad> | null = null;
   private ticking = false;
+  /** Set by a failing tick so requests that re-arm don't cut its backoff short (in memory only). */
+  private backoffUntil = 0;
   private extraOrigins: Set<string>;
   /** Per-IP request counts. In memory: a flood keeps the object alive, and losing it only resets limits. */
   private ipHits = new Map<string, { n: number; start: number }>();
@@ -712,6 +714,7 @@ export class PushStore extends DurableObject<Env> {
    * re-firing in a tight loop; `force` re-sets an alarm that looks stuck.
    */
   async rearm(notBefore = Date.now(), force = false): Promise<void> {
+    notBefore = Math.max(notBefore, this.backoffUntil);
     const next = this.sql.exec<{ t: number | null }>('SELECT MIN(due_at) AS t FROM reminders').one().t;
     const current = await this.ctx.storage.getAlarm();
     if (next === null) {
@@ -909,9 +912,10 @@ export class PushStore extends DurableObject<Env> {
       backoff = BACKOFF_MS;
     } finally {
       this.ticking = false;
+      this.backoffUntil = backoff ? Date.now() + backoff : 0;
       try {
         // Leftovers from a full batch are due now, so the alarm fires again right away.
-        await this.rearm(Date.now() + backoff);
+        await this.rearm();
       } catch (err) {
         console.error('[push] could not re-arm alarm:', err);
       }
