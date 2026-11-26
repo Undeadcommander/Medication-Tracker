@@ -18,10 +18,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # Address of the reminder server, e.g. https://dosely-push.<subdomain>.workers.dev/api (worker/, see README).
-      # Set it under Settings → Secrets and variables → Actions → Variables. Until then, "none" builds a
-      # static site whose reminders work while the app is open.
-      VITE_API_BASE: ${{ vars.VITE_API_BASE || 'none' }}
+      # Address of the reminder server (the Cloudflare Worker in worker/, see README). A VITE_API_BASE
+      # Actions variable (Settings → Secrets and variables → Actions → Variables) overrides it; "none"
+      # builds a static site whose reminders only work while the app is open.
+      VITE_API_BASE: ${{ vars.VITE_API_BASE || 'https://dosely-push.dosely-push-worker.workers.dev/api' }}
       # Use the sign-in helpers in public/__/auth so Google sign-in stays on this origin
       # (needed for iPhone/iPad Home Screen apps). See src/lib/auth.ts.
       VITE_FIREBASE_SELF_HOSTED_AUTH: 'true'
