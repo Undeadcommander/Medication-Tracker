@@ -58,8 +58,13 @@ const DEVICE_KEY = 'medtracker.deviceId';
 const MAX_SERVER_REMINDERS = 3000;
 const LOCAL_WINDOW_MS = 24 * 3_600_000;
 const LOCAL_REARM_MS = 3_600_000;
-/** A local reminder that is overdue by less than this is still shown (e.g. tab was frozen). */
-const LOCAL_GRACE_MS = 5 * 60_000;
+/**
+ * Local mode only: a dose that came due less than this long ago and is still unlogged is shown when
+ * the app starts or resumes (the OS may have suspended or killed it when the reminder was due).
+ */
+const LOCAL_CATCHUP_MS = 2 * 3_600_000;
+/** Resume events (visibility, pageshow, focus) often arrive together: handle them once. */
+const RESUME_COALESCE_MS = 1000;
 const DISCREET_TITLE = 'Time for your medication';
 const DISCREET_BODY = 'Open Dosely to review your dose.';
 const NOTIFICATION_ACTIONS = [
@@ -357,7 +362,7 @@ function buildReminders(
   meds: Medication[],
   doseLogs: DoseLog[],
   opts: SyncOptions,
-): { reminders: PushReminder[]; dismissed: string[] } {
+): { reminders: PushReminder[]; missed: PushReminder[]; dismissed: string[] } {
   const now = Date.now();
   const horizon = Math.max(1, Math.min(opts.horizonDays ?? 30, 365));
   const from = new Date(now);
@@ -381,19 +386,36 @@ function buildReminders(
   }
 
   const reminders: PushReminder[] = [];
+  // Recently due, still unlogged: local mode only (the push server never gets past reminders).
+  // At most one per medication, the most recent, so reopening after several misses doesn't spam.
+  const missed: PushReminder[] = [];
+  const catchupStart = now - LOCAL_CATCHUP_MS;
   for (const med of meds) {
     if (!med.notificationsEnabled) continue;
     const title = opts.discreet ? DISCREET_TITLE : `Time to take ${med.name}`;
     const body = opts.discreet ? DISCREET_BODY : reminderBody(med);
-    for (const occ of occurrencesBetween(med.schedule, from, to)) {
+    let latestMissed: PushReminder | null = null;
+    // Don't catch up on doses due before the med was added, its schedule changed, or its reminders
+    // were turned on: the user may already have taken them, and an alert then is just noise.
+    let catchupFrom = catchupStart;
+    for (const iso of [med.createdAt, med.fieldTimes?.schedule, med.fieldTimes?.notificationsEnabled]) {
+      const t = iso ? Date.parse(iso) : NaN;
+      if (t > catchupFrom) catchupFrom = t;
+    }
+    for (const occ of occurrencesBetween(med.schedule, new Date(Math.min(catchupFrom, now)), to)) {
       const at = occ.getTime();
       const id = `${med.id}@${at}`;
       if (logged.has(id)) continue;
-      reminders.push({ id, medId: med.id, at, title, body });
+      const r = { id, medId: med.id, at, title, body };
+      if (at < from.getTime()) {
+        if (!latestMissed || at > latestMissed.at) latestMissed = r;
+      } else reminders.push(r);
     }
+    if (latestMissed) missed.push(latestMissed);
   }
   reminders.sort((a, b) => a.at - b.at);
-  return { reminders, dismissed: dismissed.slice(-500) };
+  missed.sort((a, b) => a.at - b.at);
+  return { reminders, missed, dismissed: dismissed.slice(-500) };
 }
 
 // ---------- local fallback scheduler ----------
@@ -428,6 +450,31 @@ function claimShown(key: string): boolean {
   return true;
 }
 
+/** Undo a claim whose notification could not be shown. */
+function releaseShownNow(key: string): void {
+  shownLocally.delete(key);
+  try {
+    const raw = JSON.parse(localStorage.getItem(SHOWN_KEY) ?? '{}') as Record<string, unknown>;
+    if (raw && typeof raw === 'object' && key in raw) {
+      delete raw[key];
+      localStorage.setItem(SHOWN_KEY, JSON.stringify(raw));
+    }
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** Same lock as claiming, so a release can't race another tab's read-modify-write of SHOWN_KEY. */
+async function releaseShown(key: string): Promise<void> {
+  const release = async () => releaseShownNow(key);
+  try {
+    if (typeof navigator !== 'undefined' && navigator.locks) await navigator.locks.request(SHOWN_LOCK, release);
+    else releaseShownNow(key);
+  } catch {
+    releaseShownNow(key);
+  }
+}
+
 async function claimShownAcrossTabs(key: string): Promise<boolean> {
   const claim = async () => claimShown(key);
   try {
@@ -454,12 +501,21 @@ function notificationData(r: PushReminder) {
   };
 }
 
+/** Keys with a showLocal still in progress (e.g. waiting on the registration), so repeated re-arms don't pile up. */
+const showingLocally = new Set<string>();
+
 /** `key` dedupes; the notification itself always describes the original dose `r`. */
 async function showLocal(r: PushReminder, key = r.id): Promise<void> {
-  if (!(await claimShownAcrossTabs(key))) return;
+  if (showingLocally.has(key)) return;
+  showingLocally.add(key);
+  let claimed = false;
   try {
+    // Check we can deliver before claiming, so a reminder isn't burned when we can't show it.
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
     const reg = await activeRegistration();
-    if (!reg || Notification.permission !== 'granted') return;
+    if (!reg) return;
+    if (!(await claimShownAcrossTabs(key))) return;
+    claimed = true;
     await reg.showNotification(r.title, {
       body: r.body,
       tag: r.id,
@@ -472,6 +528,9 @@ async function showLocal(r: PushReminder, key = r.id): Promise<void> {
     } as NotificationOptions);
   } catch (err) {
     console.warn('Local notification failed:', err);
+    if (claimed) await releaseShown(key); // let a later re-arm retry
+  } finally {
+    showingLocally.delete(key);
   }
 }
 
@@ -481,14 +540,19 @@ function armLocalTimers(): number {
   localTimers = [];
   const now = Date.now();
   let armed = 0;
+  // Overdue but recent: catch up on the latest one per medication (earlier ones are skipped).
+  const catchup = new Map<string, PushReminder>();
+  for (const r of lastReminders) {
+    if (r.at <= now && now - r.at <= LOCAL_CATCHUP_MS) {
+      const prev = catchup.get(r.medId);
+      if (!prev || r.at > prev.at) catchup.set(r.medId, r);
+    }
+  }
+  for (const r of catchup.values()) void showLocal(r);
   for (const r of lastReminders) {
     const delay = r.at - now;
     if (delay > LOCAL_WINDOW_MS) break; // sorted ascending
-    if (delay <= 0) {
-      // Missed while the tab/device was suspended: show if only slightly overdue.
-      if (-delay <= LOCAL_GRACE_MS) void showLocal(r);
-      continue;
-    }
+    if (delay <= 0) continue;
     armed++;
     localTimers.push(setTimeout(() => void showLocal(r), delay));
   }
@@ -501,10 +565,19 @@ function ensureLocalMaintenance(): void {
   rearmInterval = setInterval(() => {
     if (localActive) armLocalTimers();
   }, LOCAL_REARM_MS);
-  // Timers are throttled/frozen in background tabs; re-arm and catch up on return.
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && localActive) armLocalTimers();
-  });
+  // Timers are throttled/frozen (or the app killed) in the background; re-arm and catch up on
+  // return. iOS resumes via pageshow/focus as well, and these often fire together.
+  let lastResume = 0;
+  const onResume = () => {
+    if (document.visibilityState !== 'visible' || !localActive) return;
+    const now = Date.now();
+    if (now - lastResume < RESUME_COALESCE_MS) return;
+    lastResume = now;
+    armLocalTimers();
+  };
+  document.addEventListener('visibilitychange', onResume);
+  window.addEventListener('pageshow', onResume);
+  window.addEventListener('focus', onResume);
 }
 
 // Snoozes from notifications the server can't handle (local mode) come back from the service
@@ -582,7 +655,7 @@ async function doSync(
     return { count: 0, mode: 'off' };
   }
 
-  const { reminders, dismissed } = buildReminders(meds, doseLogs, opts);
+  const { reminders, missed, dismissed } = buildReminders(meds, doseLogs, opts);
 
   if (state === 'subscribed') {
     try {
@@ -599,8 +672,8 @@ async function doSync(
   }
 
   // Local fallback (permission granted, but no subscription or the server is unreachable).
-  lastReminders = reminders;
-  if (!reminders.length) {
+  lastReminders = [...missed, ...reminders];
+  if (!lastReminders.length) {
     clearLocalTimers(); // nothing to show (e.g. signed out): no need to keep re-arming
     return { count: 0, mode: 'local' };
   }

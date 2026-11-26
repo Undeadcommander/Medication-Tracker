@@ -52,7 +52,7 @@ How it works: sign-in uses a Google popup (a full-page redirect on an iPhone/iPa
 - **iPhone/iPad** (iOS/iPadOS 16.4+): Apple only allows web push for sites that are installed to the Home Screen. In Safari, tap **Share → Add to Home Screen**, open Dosely from the Home Screen, then turn on notifications. The settings screen walks you through it.
 - Push needs **HTTPS** everywhere except `localhost`.
 
-**Reminder server.** For reminders to arrive while Dosely is *closed*, the push server (`server/index.ts`) has to run somewhere that supports Node with HTTPS and a persistent disk, such as Render, Fly.io, Railway or Google Cloud Run. GitHub Pages can't run it. Without it, the Pages site builds with `VITE_API_BASE=none`, and reminders appear only while the app is open or in the background. To connect one:
+**Reminder server.** For reminders to arrive while Dosely is *closed*, the push server (`server/index.ts`) has to run somewhere that supports Node with HTTPS and a persistent disk, such as Render, Fly.io, Railway or Google Cloud Run. GitHub Pages can't run it. Without it, the Pages site builds with `VITE_API_BASE=none`, and reminders appear only while the app is open on screen (iPhone pauses it when you switch away). Reopening within 2 hours of a missed dose shows its reminder then. To connect one:
 1. Deploy the server with `npm start`, and set `ALLOWED_ORIGINS=https://undeadcommander.github.io` and `VAPID_SUBJECT=mailto:<your address>`. Keep `server/data/` on persistent storage: if `vapid.json` changes, every device has to turn notifications on again.
 2. In GitHub, go to **Settings → Secrets and variables → Actions → Variables** and add `VITE_API_BASE` = `https://<your-server>/api`. Then re-run the Pages workflow.
 

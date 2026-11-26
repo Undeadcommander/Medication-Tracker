@@ -82,7 +82,7 @@ export function NotificationSettings({ discreet, onDiscreetChange, enabledMedCou
             {!state
               ? 'Checking…'
               : state === 'granted' && !PUSH_SERVER_CONFIGURED
-                ? 'Notifications are on. Reminders appear while Dosely is open or running in the background (this site has no reminder server for when it is closed).'
+                ? 'Notifications are on. This site has no reminder server, so reminders only appear while Dosely is open on screen. iPhone pauses it when you switch away. If you reopen it within 2 hours of a missed dose, you get that reminder then.'
                 : STATE_TEXT[state]}
           </span>
         </div>
