@@ -61,7 +61,7 @@ const LOCAL_REARM_MS = 3_600_000;
 /** A local reminder that is overdue by less than this is still shown (e.g. tab was frozen). */
 const LOCAL_GRACE_MS = 5 * 60_000;
 const DISCREET_TITLE = 'Time for your medication';
-const DISCREET_BODY = 'Open Amendra to review your dose.';
+const DISCREET_BODY = 'Open Dosely to review your dose.';
 const NOTIFICATION_ACTIONS = [
   { action: 'take', title: 'Mark as taken' },
   { action: 'snooze', title: 'Snooze 10 min' },
@@ -638,7 +638,7 @@ export async function sendTestNotification(): Promise<void> {
   }
   const reg = await activeRegistration();
   if (!reg) throw new Error('Notifications are not available in this browser.');
-  await reg.showNotification('Amendra test', {
+  await reg.showNotification('Dosely test', {
     body: 'Notifications are working on this device.',
     tag: 'medtracker-test',
     icon: ICON,

@@ -254,7 +254,7 @@ export default function App() {
       wait(null);
       if (!done) {
         setAuthError({
-          message: "Amendra couldn't finish removing this account's old data from this device. Reload the page and try again.",
+          message: "Dosely couldn't finish removing this account's old data from this device. Reload the page and try again.",
         });
         return;
       }
@@ -435,7 +435,7 @@ function Tracker({
         (r) => onEnded(r.problem ?? 'This account was deleted, so its data was removed from this device too.'),
         () =>
           onEnded(
-            "This account was deleted. Some of its data couldn't be removed from this device yet. Amendra removes the rest the next time it starts.",
+            "This account was deleted. Some of its data couldn't be removed from this device yet. Dosely removes the rest the next time it starts.",
           ),
       );
     },
@@ -645,11 +645,11 @@ function Tracker({
         <strong>{settingsProblem === 'connection' ? "Can't reach cloud sync." : "Cloud sync can't check this account's encryption settings."}</strong>{' '}
         {settingsProblem === 'access' && syncStatus?.problemMessage ? `${syncStatus.problemMessage} ` : ''}
         {lock === 'locked'
-          ? "Amendra uses these settings to unlock your data. You can still try your passphrase, but if it was changed on another device, unlocking won't work until Amendra reconnects."
+          ? "Dosely uses these settings to unlock your data. You can still try your passphrase, but if it was changed on another device, unlocking won't work until Dosely reconnects."
           : lock === 'checking'
-            ? "Until Amendra reconnects, syncing with your other devices may be paused, and turning on encryption on one of them won't be noticed here. Your data on this device is safe."
-            : "Until Amendra reconnects, syncing with your other devices may be paused, and encryption changes made on them (like a new passphrase) won't be noticed here. Your data on this device is safe."}{' '}
-        {settingsProblem === 'connection' ? "Amendra tries again when you're back online, or you can retry now." : 'You can retry now.'}
+            ? "Until Dosely reconnects, syncing with your other devices may be paused, and turning on encryption on one of them won't be noticed here. Your data on this device is safe."
+            : "Until Dosely reconnects, syncing with your other devices may be paused, and encryption changes made on them (like a new passphrase) won't be noticed here. Your data on this device is safe."}{' '}
+        {settingsProblem === 'connection' ? "Dosely tries again when you're back online, or you can retry now." : 'You can retry now.'}
       </span>
       <button type="button" className="btn btn-sm btn-ghost" onClick={() => syncControls?.retry()} disabled={!syncControls}>
         Retry
@@ -661,7 +661,7 @@ function Tracker({
   // of the account's data is loaded, so there's only unlocking it, or signing out.
   const lockedContent = (() => {
     if (isOpen) return null;
-    const offlineNote = 'Amendra needs to reach the cloud once to check whether this account is end-to-end encrypted before opening it.';
+    const offlineNote = 'Dosely needs to reach the cloud once to check whether this account is end-to-end encrypted before opening it.';
     const stays = encryptionMarker(syncUid!) === 'on' ? 'Your data stays locked on this device until then.' : offlineNote;
     // The account's encryption settings couldn't be read (still checking), and why.
     const problem = access === 'checking' && syncStatus?.state === 'error' && syncStatus.message ? (syncStatus.problem ?? 'connection') : null;
@@ -733,7 +733,7 @@ function Tracker({
       <header className="topbar">
         <div className="brand">
           <img src={`${import.meta.env.BASE_URL}icons/icon.svg`} alt="" width={32} height={32} />
-          <span>Amendra</span>
+          <span>Dosely</span>
         </div>
         <div className="topbar-actions">
           {isOpen && (
@@ -758,7 +758,7 @@ function Tracker({
 
       {!isOpen ? (
         <main className="content" key="locked">
-          <h1 className="visually-hidden">Amendra</h1>
+          <h1 className="visually-hidden">Dosely</h1>
           {lockAlert}
           {settingsAlert}
           {lockedContent}
@@ -857,7 +857,7 @@ function Tracker({
               </div>
               <h2>Add your first medication</h2>
               <p className="muted">
-                Start typing a name and Amendra will recognize it, fill in its strengths and pull up what it's for.
+                Start typing a name and Dosely will recognize it, fill in its strengths and pull up what it's for.
               </p>
               <button type="button" className="btn btn-primary" onClick={() => setDialog({ kind: 'add' })}>
                 Add medication

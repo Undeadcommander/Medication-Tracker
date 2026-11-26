@@ -1,6 +1,6 @@
 rules_version = '2';
 
-// Amendra cloud sync (end-to-end encrypted). Each signed-in Google account can read and write
+// Dosely cloud sync (end-to-end encrypted). Each signed-in Google account can read and write
 // only its own data:
 //   users/{uid}/meds/{medId}             one document per medication: { v, iv, ct, k? } (ciphertext
 //                                        only), or { v: 1, deleted: true } once it's deleted (final)

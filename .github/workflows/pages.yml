@@ -1,4 +1,4 @@
-name: Deploy Amendra to GitHub Pages
+name: Deploy Dosely to GitHub Pages
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # Address of a separately hosted reminder server (server/index.ts), e.g. https://amendra-api.example.com/api.
+      # Address of a separately hosted reminder server (server/index.ts), e.g. https://dosely-api.example.com/api.
       # Set it under Settings → Secrets and variables → Actions → Variables. Until then, "none" builds a
       # static site whose reminders work while the app is open.
       VITE_API_BASE: ${{ vars.VITE_API_BASE || 'none' }}

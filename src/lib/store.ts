@@ -436,8 +436,8 @@ export function useAppData(userId: string, syncUid?: string, onAccountDeleted?: 
     lockedOutRef.current = true; // (said until unlocked again)
     setLockError(
       edit
-        ? "Amendra was locked in another tab, so your last change wasn't saved. Unlock to keep going."
-        : 'Amendra was locked in another tab.',
+        ? "Dosely was locked in another tab, so your last change wasn't saved. Unlock to keep going."
+        : 'Dosely was locked in another tab.',
     );
     syncRef.current?.lockedElsewhere();
   }, []);

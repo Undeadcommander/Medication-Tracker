@@ -579,7 +579,7 @@ function readUnwiped(): string[] {
 /**
  * Signing the account out ended its session and started clearing this device (`on`), or finished
  * that (`!on`). While it's noted, what's left of the account here is removed before it's used here
- * again, and when Amendra next starts (see account.finishInterruptedDeletions).
+ * again, and when Dosely next starts (see account.finishInterruptedDeletions).
  */
 export function noteWipePending(userId: string, on: boolean): void {
   const list = readUnwiped().filter((id) => id !== userId);

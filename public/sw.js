@@ -1,4 +1,4 @@
-/* Amendra service worker: push notifications only (no offline caching). */
+/* Dosely service worker: push notifications only (no offline caching). */
 
 self.addEventListener('install', () => {
   self.skipWaiting();
@@ -37,7 +37,7 @@ self.addEventListener('push', (event) => {
     try {
       payload = event.data.json();
     } catch {
-      payload = { title: 'Amendra', body: event.data.text() };
+      payload = { title: 'Dosely', body: event.data.text() };
     }
   }
   const title = payload.title || 'Time for your medication';
@@ -104,7 +104,7 @@ async function handleClick(event) {
         all[0].postMessage({ type: 'snooze-local', reminder: data.reminder, minutes: 10 });
       } else {
         await self.registration.showNotification("Couldn't snooze", {
-          body: 'Open Amendra to get your reminder again.',
+          body: 'Open Dosely to get your reminder again.',
           tag: 'medtracker-snooze-failed',
           icon: ICON,
         });

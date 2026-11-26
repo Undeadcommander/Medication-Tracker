@@ -495,7 +495,7 @@ app.post(
     if (now - (lastTest.get(deviceId) ?? 0) < TEST_COOLDOWN_MS) throw new HttpError(429, 'slow down');
     lastTest.set(deviceId, now);
     const result = await pushTo(deviceId, rec, {
-      title: 'Amendra test',
+      title: 'Dosely test',
       body: 'Notifications are working on this device.',
       tag: 'medtracker-test',
       data: { test: true, deviceId },

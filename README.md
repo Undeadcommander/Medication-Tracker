@@ -1,11 +1,11 @@
-# Amendra
+# Dosely
 
 A medication tracker you can install as an app (PWA). Add your medications, set when to take them, and get reminder notifications on desktop and iOS.
 
 ## Features
 
 - **Medication tiles.** Each tile shows the name, strength and form, the schedule, the next dose, what the medication is for, today's progress and the remaining supply. Click a tile to open the detail view, which adds adherence, upcoming doses, 14-day history, prescriber and pharmacy, notes, and label information (uses, warnings, side effects, interactions).
-- **Automatic medication recognition.** As you type, names are matched against the U.S. National Library of Medicine's RxTerms/RxNorm databases. Picking a strength fills in the dose and form. Amendra then looks up the generic and brand names and the drug class (RxClass), and pulls FDA label text (openFDA). Typos get "Did you mean…?" suggestions. Unknown medications can still be added by hand.
+- **Automatic medication recognition.** As you type, names are matched against the U.S. National Library of Medicine's RxTerms/RxNorm databases. Picking a strength fills in the dose and form. Dosely then looks up the generic and brand names and the drug class (RxClass), and pulls FDA label text (openFDA). Typos get "Did you mean…?" suggestions. Unknown medications can still be added by hand.
 - **Schedules.** The presets are *Every day*, *Twice a day* and *Every other day*. *Custom* repeats every N days, or every N weeks on chosen weekdays. Every schedule has start and optional end dates, and you can turn on "Choose specific times" to pick exact dose times (custom allows up to 8 a day).
 - **Reminders.** Each medication has its own on/off switch for notifications, and reminders follow its schedule. The notification has **Mark as taken** and **Snooze 10 min** buttons. *Discreet mode* leaves the medication name out of notifications and never sends it to the server.
 - **Today panel.** Take, skip or undo each dose. Supply on hand counts down automatically.
@@ -49,10 +49,10 @@ How it works: sign-in uses a Google popup (a full-page redirect on an iPhone/iPa
 ### Push notifications
 
 - **Desktop** (Chrome, Edge, Firefox, Safari): open the account menu, choose **Notification settings**, then **Turn on notifications**.
-- **iPhone/iPad** (iOS/iPadOS 16.4+): Apple only allows web push for sites that are installed to the Home Screen. In Safari, tap **Share → Add to Home Screen**, open Amendra from the Home Screen, then turn on notifications. The settings screen walks you through it.
+- **iPhone/iPad** (iOS/iPadOS 16.4+): Apple only allows web push for sites that are installed to the Home Screen. In Safari, tap **Share → Add to Home Screen**, open Dosely from the Home Screen, then turn on notifications. The settings screen walks you through it.
 - Push needs **HTTPS** everywhere except `localhost`.
 
-**Reminder server.** For reminders to arrive while Amendra is *closed*, the push server (`server/index.ts`) has to run somewhere that supports Node with HTTPS and a persistent disk, such as Render, Fly.io, Railway or Google Cloud Run. GitHub Pages can't run it. Without it, the Pages site builds with `VITE_API_BASE=none`, and reminders appear only while the app is open or in the background. To connect one:
+**Reminder server.** For reminders to arrive while Dosely is *closed*, the push server (`server/index.ts`) has to run somewhere that supports Node with HTTPS and a persistent disk, such as Render, Fly.io, Railway or Google Cloud Run. GitHub Pages can't run it. Without it, the Pages site builds with `VITE_API_BASE=none`, and reminders appear only while the app is open or in the background. To connect one:
 1. Deploy the server with `npm start`, and set `ALLOWED_ORIGINS=https://undeadcommander.github.io` and `VAPID_SUBJECT=mailto:<your address>`. Keep `server/data/` on persistent storage: if `vapid.json` changes, every device has to turn notifications on again.
 2. In GitHub, go to **Settings → Secrets and variables → Actions → Variables** and add `VITE_API_BASE` = `https://<your-server>/api`. Then re-run the Pages workflow.
 

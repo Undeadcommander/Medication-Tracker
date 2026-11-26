@@ -187,7 +187,7 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null, wai
     <main className="signin">
       <div className="signin-card card">
         <img src={`${import.meta.env.BASE_URL}icons/icon.svg`} alt="" width={64} height={64} className="signin-logo" />
-        <h1>Amendra</h1>
+        <h1>Dosely</h1>
         <p className="muted">Keep track of your medications, schedules and reminders, all in one place.</p>
 
         {notice && (
@@ -217,7 +217,7 @@ export function SignInScreen({ onSignIn, initialError = null, notice = null, wai
         {busy && stalled && !waiting && (
           <div className="alert alert-warning signin-stalled" role="status">
             <p>
-              This is taking longer than it should. If you've finished signing in with Google, reload Amendra to pick up
+              This is taking longer than it should. If you've finished signing in with Google, reload Dosely to pick up
               your account.
             </p>
             <div className="signin-stalled-actions">

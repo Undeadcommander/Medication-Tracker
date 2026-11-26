@@ -141,7 +141,7 @@ function PassphraseFields({ p, label = 'Sync passphrase' }: { p: ReturnType<type
             {copied === 'ok' ? 'Copied' : 'Copy'}
           </button>
           <p className="field-hint ei-generated-note">
-            Save it in a password manager or write it down. You'll need it to unlock Amendra on a new device.
+            Save it in a password manager or write it down. You'll need it to unlock Dosely on a new device.
             {copied === 'fail' && ' Copying was blocked, so select the text and copy it manually.'}
           </p>
         </div>
@@ -157,16 +157,16 @@ function printRecoveryKey(key: string) {
   document.body.appendChild(frame);
   const doc = frame.contentDocument!;
   doc.open();
-  doc.write('<!doctype html><title>Amendra recovery key</title>');
+  doc.write('<!doctype html><title>Dosely recovery key</title>');
   doc.close();
   const h = doc.createElement('h1');
-  h.textContent = 'Amendra recovery key';
+  h.textContent = 'Dosely recovery key';
   const k = doc.createElement('p');
   k.textContent = key;
   k.style.cssText = 'font:600 22px ui-monospace,Menlo,Consolas,monospace;letter-spacing:1px';
   const note = doc.createElement('p');
   note.textContent =
-    'This key unlocks your encrypted Amendra cloud sync if you forget your sync passphrase. Keep it somewhere safe and private.';
+    'This key unlocks your encrypted Dosely cloud sync if you forget your sync passphrase. Keep it somewhere safe and private.';
   doc.body.append(h, k, note);
   frame.contentWindow?.focus();
   frame.contentWindow?.print();
@@ -174,11 +174,11 @@ function printRecoveryKey(key: string) {
 }
 
 function downloadRecoveryKey(key: string) {
-  const text = `Amendra recovery key\n\n${key}\n\nThis key unlocks your encrypted Amendra cloud sync if you forget your sync passphrase.\nKeep it somewhere safe and private.\n`;
+  const text = `Dosely recovery key\n\n${key}\n\nThis key unlocks your encrypted Dosely cloud sync if you forget your sync passphrase.\nKeep it somewhere safe and private.\n`;
   const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'amendra-recovery-key.txt';
+  a.download = 'dosely-recovery-key.txt';
   a.style.display = 'none';
   document.body.appendChild(a);
   a.click();
@@ -573,7 +573,7 @@ export function SyncEncryptionDialog({ status, controls, onClose, inline = false
           </div>
         )}
         <p className="ei-lead">
-          Amendra encrypts your medications and dose history on this device before syncing them, so only you can read
+          Dosely encrypts your medications and dose history on this device before syncing them, so only you can read
           them. Not Google, and not the app's developer. Choose a sync passphrase: you'll enter it once on each new
           device.
         </p>
@@ -710,7 +710,7 @@ export function SyncEncryptionDialog({ status, controls, onClose, inline = false
         <section className="enc-section">
           <h3>This device</h3>
           <p className="field-hint">
-            Forgetting the key locks Amendra on this device: your data here is kept, encrypted, and opens again once you
+            Forgetting the key locks Dosely on this device: your data here is kept, encrypted, and opens again once you
             enter your sync passphrase. Signing out also forgets it.
           </p>
           {confirmForget ? (

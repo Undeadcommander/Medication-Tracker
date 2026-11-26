@@ -1204,7 +1204,7 @@ describe('settings this version cannot read', () => {
     await mountApp();
     expect(text()).not.toContain('Lisinopril');
     expect(text()).toContain("Cloud sync can't be opened");
-    expect(text()).toContain('newer version of Amendra');
+    expect(text()).toContain('newer version of Dosely');
     expect(state.storage.get(`medtracker.e2ee.${UID}`)).toBe('1');
   });
 });
@@ -1499,7 +1499,7 @@ describe('cloud sync that cannot be reached or read (B)', () => {
     expect(text()).toContain('Unlock cloud sync');
     await pushMeta({ v: 2, keyId: 'k2' });
     expect(text()).toContain("Cloud sync can't be opened");
-    expect(text()).toContain('newer version of Amendra');
+    expect(text()).toContain('newer version of Dosely');
     expect(text()).not.toContain('Unlock cloud sync');
     expect(walkEls(fakeDoc.documentElement, (el) => el.tagName === 'INPUT')).toHaveLength(0);
   });
@@ -2106,7 +2106,7 @@ describe('locking a device whose account settings are unreadable (D1)', () => {
     expect(status.lock).toBe('checking');
     expect(status.state).toBe('error');
     expect(status.problem).toBe('settings');
-    expect(status.message).toContain('newer version of Amendra');
+    expect(status.message).toContain('newer version of Dosely');
     await expect(ref.api!.syncControls!.unlock(PASS, 'passphrase')).rejects.toThrow();
   });
 

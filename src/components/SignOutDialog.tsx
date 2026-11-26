@@ -39,7 +39,7 @@ const REASON_TEXT: Record<SignOutProblem['reason'], string> = {
   deleting: 'This account is being deleted on another device.',
   error: "Your changes couldn't be saved to the cloud.",
   timeout: "The cloud didn't confirm your changes in time.",
-  'not-ready': "Cloud sync is still starting, so Amendra can't tell yet whether everything is saved in the cloud.",
+  'not-ready': "Cloud sync is still starting, so Dosely can't tell yet whether everything is saved in the cloud.",
   busy: 'This account is already being signed out or deleted in another tab.',
 };
 

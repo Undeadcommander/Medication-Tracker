@@ -100,15 +100,15 @@ export function DeleteAccountDialog({ user, sync, medicationCount, doseLogCount,
       <form id={`${id}-form`} onSubmit={submit} style={{ display: 'grid', gap: 14 }}>
         {google ? (
           <>
-            <p>This permanently deletes your Amendra account and everything stored for it:</p>
+            <p>This permanently deletes your Dosely account and everything stored for it:</p>
             <ul style={{ margin: 0, paddingLeft: 20, display: 'grid', gap: 4 }}>
               <li>{what}, on this device and in the cloud</li>
               <li>Your encrypted cloud copy and its encryption settings</li>
-              <li>Your Amendra sign-in and the reminders on this device</li>
+              <li>Your Dosely sign-in and the reminders on this device</li>
             </ul>
             <p className="muted" style={{ fontSize: '0.9rem' }}>
               Your Google account itself isn't affected. Other devices signed in to this account remove their copies
-              the next time they're online with Amendra open.
+              the next time they're online with Dosely open.
             </p>
           </>
         ) : (

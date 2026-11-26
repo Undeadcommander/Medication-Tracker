@@ -132,14 +132,14 @@ export type SignOutResult =
   /**
    * Signed out (this tab's session has ended). `problem`: part of this device's copy couldn't be
    * removed, worded for the user (it's removed before the account is used here again, and when
-   * Amendra next starts).
+   * Dosely next starts).
    */
   | { status: 'signed-out'; problem?: string }
   | { status: 'cancelled' }
   | { status: 'blocked'; problem: SignOutProblem };
 
 export const SIGN_OUT_DEVICE_PROBLEM =
-  "You signed out, but some of your data couldn't be removed from this device yet. Amendra removes the rest the next time it starts, and before this account is used here again.";
+  "You signed out, but some of your data couldn't be removed from this device yet. Dosely removes the rest the next time it starts, and before this account is used here again.";
 
 /**
  * Sign out of a Google account: upload everything this device has that the cloud doesn't, wait
@@ -218,7 +218,7 @@ export async function signOutAndClear(
     await endSessionHere(user.id); // this tab stops saving and syncing too
     // From here the session has ended: this resolves signed out whatever happens. If clearing
     // the device doesn't finish (it fails, or the tab closes), what's left is removed before the
-    // account is used here again (see finishDeletionBeforeReuse) and when Amendra next starts.
+    // account is used here again (see finishDeletionBeforeReuse) and when Dosely next starts.
     noteWipePending(user.id, true);
     try {
       await wipeDevice(user, { keepFirebaseSignIn: true });
@@ -278,7 +278,7 @@ export async function wipeAfterAccountDeleted(user: User): Promise<{ problem?: s
   return problem ? { problem } : {};
 }
 
-const DEVICE_PROBLEM = "Some of its data couldn't be removed from this device yet. Amendra removes the rest the next time it starts.";
+const DEVICE_PROBLEM = "Some of its data couldn't be removed from this device yet. Dosely removes the rest the next time it starts.";
 
 /** What didn't work once the account's data was gone, for the user (undefined: nothing). */
 function deletionProblem(accountError: unknown, deviceFailed: boolean): string | undefined {
@@ -364,7 +364,7 @@ export async function deleteAccount(
       await wipeDevice(user, { keepFirebaseSignIn: google });
       markDeviceWiped(user.id);
     } catch {
-      // What's left is removed before the account (or a guest) is used here again, and when Amendra
+      // What's left is removed before the account (or a guest) is used here again, and when Dosely
       // next starts (see finishInterruptedDeletions).
       deviceFailed = true;
     }

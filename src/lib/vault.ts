@@ -527,7 +527,7 @@ function pad(n: number): string {
 
 export function downloadVault(file: VaultFile, filename?: string): void {
   const now = new Date();
-  const name = filename ?? `amendra-backup-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}.medvault`;
+  const name = filename ?? `dosely-backup-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}.medvault`;
   const blob = new Blob([JSON.stringify(file)], { type: 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

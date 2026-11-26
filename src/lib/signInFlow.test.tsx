@@ -729,7 +729,7 @@ describe('#6 authError object identity and clearing on sign-in', () => {
 
     await mountApp();
     await click(buttons('Continue without an account')[0]);
-    const expectedMsg = "Amendra couldn't finish removing this account's old data from this device.";
+    const expectedMsg = "Dosely couldn't finish removing this account's old data from this device.";
     expect(text()).toContain(expectedMsg);
 
     // Tapping Sign in with Google clears SignInScreen's local error state and returns null (cancelled).
@@ -750,7 +750,7 @@ describe('#6 authError object identity and clearing on sign-in', () => {
 
     await mountApp();
     await click(buttons('Continue without an account')[0]);
-    const expectedMsg = "Amendra couldn't finish removing this account's old data from this device.";
+    const expectedMsg = "Dosely couldn't finish removing this account's old data from this device.";
     expect(text()).toContain(expectedMsg);
 
     await click(buttons('Continue without an account')[0]);

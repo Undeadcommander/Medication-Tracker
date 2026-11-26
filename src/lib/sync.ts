@@ -1837,7 +1837,7 @@ export function startSync(opts: {
       for (;;) {
         if (signal?.aborted) return fail('cancelled');
         if (stopped) {
-          return fail('error', cloudDeleted ? 'This account has been deleted.' : 'Cloud sync has stopped. Reload Amendra and try again.');
+          return fail('error', cloudDeleted ? 'This account has been deleted.' : 'Cloud sync has stopped. Reload Dosely and try again.');
         }
         // Other open tabs upload what they queued themselves (and closed tabs' entries are taken
         // over as usual, see watchOrphans). Taking a live tab's entries could read an item from
